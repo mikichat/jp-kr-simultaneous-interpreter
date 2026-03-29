@@ -1,0 +1,7 @@
+{
+  "name": "JP-KR Simultaneous Interpreter",
+  "description": "Translates Japanese speech (input as text) into fluent, conversational Korean in real-time.",
+  "requestFramePermissions": [
+    "microphone"
+  ]
+}
