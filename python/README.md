@@ -5,15 +5,18 @@
 ### 1. 사전 설치
 
 **Ollama 설치** (로컬 LLM 실행 엔진):
+
 ```
 https://ollama.ai/download 에서 다운로드 및 설치
 ```
 
 **번역 모델 다운로드** (처음 1회):
+
 ```bash
-ollama pull qwen2.5:7b
+ollama pull aya-expanse:8b
 ```
 
+> 💡 추천 모델: `ollama pull aya-expanse:8b` (5GB, 속도 빠름)
 > 💡 더 가벼운 모델: `ollama pull qwen2.5:3b` (3GB, 속도 빠름)  
 > 💡 더 좋은 모델: `ollama pull qwen2.5:14b` (9GB, 품질 좋음)
 
@@ -26,6 +29,7 @@ start_python.bat 더블클릭
 ```
 
 최초 실행 시 자동으로:
+
 - Python 가상환경 생성
 - Faster-Whisper, Ollama 라이브러리 설치
 - Ollama 서버 시작
@@ -35,6 +39,7 @@ start_python.bat 더블클릭
 ### 3. PC 사운드 캡처 설정 (윈도우)
 
 PC에서 재생되는 소리를 번역하려면:
+
 1. `Win + R` → `mmsys.cpl`
 2. **녹음** 탭 선택
 3. **스테레오 믹스** 우클릭 → 사용
@@ -44,11 +49,11 @@ PC에서 재생되는 소리를 번역하려면:
 
 ### 4. 구성 파일 (`python/translator.py`)
 
-| 설정 | 기본값 | 설명 |
-|------|--------|------|
-| `WHISPER_MODEL` | `small` | tiny/base/small/medium 중 선택 |
-| `OLLAMA_MODEL` | `qwen2.5:7b` | 사용할 Ollama 모델 |
-| `CHUNK_SEC` | `4` | 오디오 처리 단위(초) |
+| 설정            | 기본값       | 설명                           |
+| --------------- | ------------ | ------------------------------ |
+| `WHISPER_MODEL` | `small`      | tiny/base/small/medium 중 선택 |
+| `OLLAMA_MODEL`  | `qwen2.5:7b` | 사용할 Ollama 모델             |
+| `CHUNK_SEC`     | `4`          | 오디오 처리 단위(초)           |
 
 ---
 
