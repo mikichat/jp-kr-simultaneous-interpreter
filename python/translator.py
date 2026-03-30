@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-JP→KR 동시통역 (로컬 LLM 버전) - 비동기 파이프라인
+JP/EN→KR 동시통역 (로컬 LLM 버전) - 비동기 파이프라인
 - 오디오 캡처: sounddevice
 - 음성인식: faster-whisper (로컬)
 - 번역: Ollama 로컬 LLM
@@ -56,8 +56,10 @@ WHISPER_MODEL = "small"       # tiny / base / small / medium
 OLLAMA_MODEL  = "aya-expanse:8b"  # ollama pull aya-expanse:8b
 OLLAMA_HOST   = "http://localhost:11434"
 MAX_HISTORY   = 15            # 표시할 최대 히스토리 수
+CONTEXT_HISTORY = 5           # 번역 시 문맥으로 참조할 최근 히스토리 수
 STT_WORKERS   = 1             # STT 워커 수 (CPU 기반이라 1개 권장)
 TRANSLATE_WORKERS = 2         # 번역 워커 수 (Ollama 응답 대기 동안 병렬 처리)
+SOURCE_LANG   = "ja"          # 소스 언어 (ja/en/auto)
 SILENCE_MULTIPLIER = 2.0      # 노이즈 플로어 대비 이 배수 이상이면 음성으로 판단
 MIN_RMS_THRESHOLD  = 0.0005   # RMS 최소 임계값 (이 아래는 무조건 무음)
 
@@ -75,7 +77,7 @@ translate_queue: "queue.Queue[str]" = queue.Queue(maxsize=20)   # 번역 대기 
 history_lock = threading.Lock()
 history: list[dict] = []
 
-current_jp = ""
+current_src = ""   # 현재 인식된 원문 (일본어 또는 영어)
 current_kr = ""
 is_running = False
 status_msg = "대기 중"
@@ -251,34 +253,39 @@ def stt_worker(whisper: WhisperModel, worker_id: int):
             status_msg = "🎙️  음성인식 중..."
 
             try:
-                logging.info(f"[STT-{worker_id}] Whisper 음성인식 시작...")
+                lang_param = SOURCE_LANG if SOURCE_LANG != "auto" else None
+                lang_label = {"ja": "일본어", "en": "영어"}.get(SOURCE_LANG, "자동감지")
+                logging.info(f"[STT-{worker_id}] Whisper 음성인식 시작... (언어: {lang_label})")
                 start_time = time.time()
-                segments, info = whisper.transcribe(
-                    audio_data,
-                    language="ja",
-                    beam_size=3,
-                    vad_filter=True,
-                    vad_parameters={"min_silence_duration_ms": 200},
-                )
-                jp_text = " ".join(s.text.strip() for s in segments).strip()
+                transcribe_kwargs = {
+                    "beam_size": 3,
+                    "vad_filter": True,
+                    "vad_parameters": {"min_silence_duration_ms": 200},
+                }
+                if lang_param:
+                    transcribe_kwargs["language"] = lang_param
+                segments, info = whisper.transcribe(audio_data, **transcribe_kwargs)
+                src_text = " ".join(s.text.strip() for s in segments).strip()
+                detected_lang = getattr(info, 'language', SOURCE_LANG)
                 elapsed = time.time() - start_time
-                logging.info(f"[STT-{worker_id}] 인식결과 ({elapsed:.1f}초): {jp_text}")
+                logging.info(f"[STT-{worker_id}] 인식결과 ({elapsed:.1f}초) [감지언어: {detected_lang}]: {src_text}")
             except Exception as e:
                 error_msg = f"STT 오류: {e}"
-                logging.error(f"[STT-{worker_id} 오류] {e}")
+                logging.error(f"[STT-{worker_id} 오류] {e}", exc_info=True)
                 status_msg = "대기 중"
                 continue
 
-            if not jp_text:
+            if not src_text:
                 logging.info(f"[STT-{worker_id}] 텍스트가 비어있음 (스킵)")
                 status_msg = "대기 중"
                 continue
 
-            current_jp = jp_text
+            current_src = src_text
 
-            # translate_queue에 넣기
+            # translate_queue에 넣기 (감지된 언어 정보도 함께)
+            item = {"text": src_text, "lang": detected_lang}
             try:
-                translate_queue.put_nowait(jp_text)
+                translate_queue.put_nowait(item)
                 logging.info(f"[STT-{worker_id}] → 번역 큐 전달 (대기: {translate_queue.qsize()})")
             except queue.Full:
                 logging.warning(f"[STT-{worker_id}] 번역 큐 가득참, 최신 텍스트로 교체")
@@ -286,7 +293,7 @@ def stt_worker(whisper: WhisperModel, worker_id: int):
                     translate_queue.get_nowait()
                 except queue.Empty:
                     pass
-                translate_queue.put_nowait(jp_text)
+                translate_queue.put_nowait(item)
 
             status_msg = "대기 중"
 
@@ -301,24 +308,59 @@ def stt_worker(whisper: WhisperModel, worker_id: int):
 
 # ─────────────────────────────────────────────
 # [파이프라인 3단계] 번역 워커
-# - translate_queue에서 일본어 텍스트를 꺼내 Ollama로 번역
+# - translate_queue에서 소스 텍스트를 꺼내 Ollama로 번역
+# - 최근 번역 히스토리를 문맥으로 참조하여 문장 문맥 완성
 # - 여러 워커가 병렬로 번역 처리 가능
 # ─────────────────────────────────────────────
+def _build_context_prompt(src_text: str, src_lang: str) -> str:
+    """최근 번역 히스토리를 참조하여 문맥 인식 번역 프롬프트를 생성합니다."""
+    lang_name = {"ja": "일본어", "en": "영어"}.get(src_lang, "외국어")
+
+    # 최근 히스토리 가져오기 (스레드 안전)
+    context_lines = []
+    with history_lock:
+        recent = history[:CONTEXT_HISTORY]  # 최신 N개 (역순으로 저장되어 있음)
+    
+    if recent:
+        # 시간순으로 정렬 (역순 → 정순)
+        recent_ordered = list(reversed(recent))
+        context_block = "\n".join(
+            f"  원문: {item['src']}\n  번역: {item['kr']}" 
+            for item in recent_ordered
+        )
+        prompt = (
+            f"당신은 실시간 동시통역사입니다. "
+            f"{lang_name}를 자연스러운 한국어로 번역해주세요.\n\n"
+            f"[최근 번역 히스토리 (문맥 참조용)]\n{context_block}\n\n"
+            f"위 히스토리의 흐름과 문맥을 이어받아, 아래 문장을 자연스럽게 번역하세요.\n"
+            f"앞 문장의 맥락을 고려하여 대화/내용의 흐름이 자연스럽게 이어지도록 해주세요.\n"
+            f"번역문만 출력하세요. 설명이나 원문 반복 없이 번역 결과만:\n\n"
+            f"{src_text}"
+        )
+    else:
+        prompt = (
+            f"다음 {lang_name}를 자연스러운 한국어로 번역해주세요. "
+            f"번역문만 출력하세요:\n\n{src_text}"
+        )
+    
+    return prompt
+
+
 def translate_worker(ollama: OllamaClient, worker_id: int):
     global current_kr, status_msg, translate_pending, error_msg
 
     while is_running:
         try:
-            jp_text = translate_queue.get(timeout=0.5)
+            item = translate_queue.get(timeout=0.5)
+            src_text = item["text"]
+            src_lang = item.get("lang", SOURCE_LANG)
             translate_pending = translate_queue.qsize()
             status_msg = "🔄  번역 중..."
 
             try:
-                prompt = (
-                    f"다음 일본어를 자연스러운 한국어로 번역해주세요. "
-                    f"번역문만 출력하세요:\n\n{jp_text}"
-                )
-                logging.info(f"[번역-{worker_id}] 요청 중... (모델: {OLLAMA_MODEL})")
+                prompt = _build_context_prompt(src_text, src_lang)
+                logging.info(f"[번역-{worker_id}] 요청 중... (모델: {OLLAMA_MODEL}, 언어: {src_lang})")
+                logging.debug(f"[번역-{worker_id}] 프롬프트:\n{prompt}")
                 start_time = time.time()
                 response = ollama.chat(
                     model=OLLAMA_MODEL,
@@ -338,11 +380,14 @@ def translate_worker(ollama: OllamaClient, worker_id: int):
             error_msg = ""
 
             # 히스토리 추가 (스레드 안전)
+            lang_flag = {"ja": "🇯🇵", "en": "🇺🇸"}.get(src_lang, "🌐")
             with history_lock:
                 history.insert(0, {
                     "time": datetime.now().strftime("%H:%M:%S"),
-                    "jp": jp_text,
+                    "src": src_text,
                     "kr": kr_text,
+                    "lang": src_lang,
+                    "flag": lang_flag,
                 })
                 if len(history) > MAX_HISTORY:
                     history.pop()
@@ -372,21 +417,26 @@ def build_ui() -> Layout:
         Layout(name="footer", size=3),
     )
 
-    # 헤더
+    # 헤더 - 소스 언어 표시
+    lang_display = {"ja": "JP", "en": "EN", "auto": "AUTO"}.get(SOURCE_LANG, "?")
+    lang_flag = {"ja": "🎌", "en": "🇺🇸", "auto": "🌐"}.get(SOURCE_LANG, "🌐")
     header_text = Text()
-    header_text.append("🎌 ", style="bold red")
-    header_text.append("JP → KR ", style="bold white")
+    header_text.append(f"{lang_flag} ", style="bold red")
+    header_text.append(f"{lang_display} → KR ", style="bold white")
     header_text.append("동시통역 ", style="bold yellow")
     header_text.append(f"| 비동기 파이프라인 (STT×{STT_WORKERS} / 번역×{TRANSLATE_WORKERS})", style="dim")
+    header_text.append(f" | 문맥참조: 최근 {CONTEXT_HISTORY}줄", style="dim cyan")
     layout["header"].update(
         Panel(Align.center(header_text), border_style="bright_blue", padding=(0, 2))
     )
 
     # 현재 번역 결과
-    jp_panel = Panel(
-        Text(current_jp or "[dim]일본어 음성 대기 중...[/dim]", no_wrap=False),
-        title="[bold red]🇯🇵 日本語[/bold red]",
-        border_style="red",
+    src_title_map = {"ja": "[bold red]🇯🇵 日本語[/bold red]", "en": "[bold green]🇺🇸 English[/bold green]", "auto": "[bold yellow]🌐 원문 (자동감지)[/bold yellow]"}
+    src_style_map = {"ja": "red", "en": "green", "auto": "yellow"}
+    src_panel = Panel(
+        Text(current_src or "[dim]음성 대기 중...[/dim]", no_wrap=False),
+        title=src_title_map.get(SOURCE_LANG, "[bold]원문[/bold]"),
+        border_style=src_style_map.get(SOURCE_LANG, "white"),
         padding=(0, 1),
     )
     kr_panel = Panel(
@@ -396,7 +446,7 @@ def build_ui() -> Layout:
         padding=(0, 1),
     )
     layout["current"].update(
-        Layout(Columns([jp_panel, kr_panel], equal=True, expand=True))
+        Layout(Columns([src_panel, kr_panel], equal=True, expand=True))
     )
 
     # 히스토리
@@ -409,17 +459,26 @@ def build_ui() -> Layout:
         padding=(0, 1),
     )
     hist_table.add_column("시각", style="dim", width=10, no_wrap=True)
-    hist_table.add_column("日本語", style="red", ratio=2)
+    hist_table.add_column("언어", style="dim", width=4, no_wrap=True)
+    hist_table.add_column("원문", ratio=2)
     hist_table.add_column("한국어", style="blue", ratio=3)
 
     with history_lock:
         for item in history:
-            hist_table.add_row(item["time"], item["jp"], item["kr"])
+            flag = item.get("flag", "🌐")
+            lang = item.get("lang", "?")
+            src_style = "red" if lang == "ja" else ("green" if lang == "en" else "white")
+            hist_table.add_row(
+                item["time"],
+                flag,
+                Text(item["src"], style=src_style),
+                item["kr"],
+            )
 
     layout["history"].update(
         Panel(
             hist_table if history else Align.center(Text("[dim]번역 히스토리가 없습니다[/dim]")),
-            title="[dim]📜 번역 히스토리[/dim]",
+            title="[dim]📜 번역 히스토리 (문맥 참조)[/dim]",
             border_style="dim",
         )
     )
@@ -449,20 +508,37 @@ def build_ui() -> Layout:
 # ─────────────────────────────────────────────
 # 메인
 # ─────────────────────────────────────────────
+def select_language() -> str:
+    """소스 언어를 선택합니다."""
+    console.print("\n[cyan]소스 언어를 선택하세요:[/cyan]")
+    console.print("  [bold]1[/bold]  🎌  일본어 (JP → KR)")
+    console.print("  [bold]2[/bold]  🇺🇸  영어   (EN → KR)")
+    console.print("  [bold]3[/bold]  🌐  자동감지 (AUTO → KR)")
+    console.print()
+    choice = Prompt.ask(
+        "[cyan]번호를 입력하세요[/cyan]",
+        default="1",
+        choices=["1", "2", "3"],
+    )
+    lang_map = {"1": "ja", "2": "en", "3": "auto"}
+    return lang_map[choice]
+
+
 def main():
-    global is_running
+    global is_running, SOURCE_LANG
 
     console.print(
         Panel(
-            "[bold cyan]JP → KR 동시통역기[/bold cyan]\n"
-            "[dim]로컬 Whisper + Ollama 기반 실시간 번역 (비동기 파이프라인)[/dim]",
+            "[bold cyan]JP / EN → KR 동시통역기[/bold cyan]\n"
+            "[dim]로컬 Whisper + Ollama 기반 실시간 번역 (비동기 파이프라인)[/dim]\n"
+            "[dim]✨ 최근 히스토리 문맥 참조 번역 지원[/dim]",
             border_style="cyan",
             padding=(1, 4),
         )
     )
 
     # 1. Ollama 연결 확인
-    console.print("\n[cyan]1/3  Ollama 연결 확인 중...[/cyan]")
+    console.print("\n[cyan]1/4  Ollama 연결 확인 중...[/cyan]")
     try:
         ollama = OllamaClient(host=OLLAMA_HOST)
         models = ollama.list()
@@ -488,7 +564,7 @@ def main():
         sys.exit(1)
 
     # 2. Whisper 모델 로드
-    console.print(f"\n[cyan]2/3  Whisper 모델 로드 중 ({WHISPER_MODEL})...[/cyan]")
+    console.print(f"\n[cyan]2/4  Whisper 모델 로드 중 ({WHISPER_MODEL})...[/cyan]")
     try:
         whisper = WhisperModel(WHISPER_MODEL, device="cpu", compute_type="int8")
         console.print("[green]✓ Whisper 모델 로드 완료[/green]")
@@ -496,15 +572,22 @@ def main():
         console.print(f"[red]✗ Whisper 로드 실패: {e}[/red]")
         sys.exit(1)
 
-    # 3. 오디오 장치 선택
-    console.print(f"\n[cyan]3/3  오디오 장치 선택[/cyan]")
+    # 3. 소스 언어 선택
+    SOURCE_LANG = select_language()
+    lang_display = {"ja": "일본어 (JP)", "en": "영어 (EN)", "auto": "자동감지 (AUTO)"}.get(SOURCE_LANG, "?")
+    console.print(f"[green]✓ 소스 언어: {lang_display}[/green]")
+
+    # 4. 오디오 장치 선택
+    console.print(f"\n[cyan]4/4  오디오 장치 선택[/cyan]")
     device_idx = select_device()
     dev_info = sd.query_devices(device_idx)
     device_name = dev_info['name']
     console.print(f"[green]✓ 선택된 장치: {device_name}[/green]\n")
     logging.info(f"--- 프로그램 시작 (비동기 파이프라인) ---")
+    logging.info(f"소스 언어: {lang_display}")
     logging.info(f"선택된 오디오 장치: [{device_idx}] {device_name}")
     logging.info(f"STT 워커: {STT_WORKERS}개, 번역 워커: {TRANSLATE_WORKERS}개")
+    logging.info(f"문맥 참조 히스토리: 최근 {CONTEXT_HISTORY}줄")
 
     # 시작
     is_running = True
