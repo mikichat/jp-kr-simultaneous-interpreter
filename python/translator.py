@@ -90,6 +90,74 @@ noise_floor = 0.0     # 적응형 노이즈 플로어 (자동 측정)
 current_rms = 0.0     # 현재 RMS (UI 표시용)
 
 # ─────────────────────────────────────────────
+# [문맥 관리] 대화 맥락 추적기
+# - 이전 대화에서 언급된 핵심 용어/이름/주제를 기억
+# - 시제, 상황, 화자 관계를 추적하여 자연스러운 번역 지원
+# ─────────────────────────────────────────────
+class ConversationContext:
+    """대화 맥락을 추적하여 문장 간 연관성을 고려한 번역 지원"""
+
+    def __init__(self, max_terms: int = 20):
+        self.max_terms = max_terms
+        self.terms: dict[str, str] = {}  # 용어: 원어 → 번역어 (고정)
+        self.topic: str = ""             # 현재 대화 주제
+        self.last_speaker: str = ""       # 마지막 발언자 (省略 analyser)
+        self.topic_keywords: list[str] = []  # 주제 관련 키워드
+        self.sentence_count: int = 0      # 총 대화 수 (시점 판단용)
+
+    def add_translation(self, src_text: str, kr_text: str, src_lang: str):
+        """새 번역 결과를 바탕으로 맥락 업데이트"""
+        self.sentence_count += 1
+
+        # 핵심 고유 명사 추출 (단어 길이 2~6, 숫자/기호 없음)
+        import re
+        words = re.findall(r'[가-힣]{2,6}|[A-Z][a-z]{1,20}|[A-Z]{2,}', src_text)
+        for word in words:
+            if word not in self.terms:
+                # 해당 단어의 한국어 번역 찾기
+                kr_words = re.findall(r'[가-힣]{2,6}', kr_text)
+                for kr_word in kr_words:
+                    if len(kr_word) == len(word) or len(kr_word) >= 2:
+                        self.terms[word] = kr_word
+                        break
+            if len(self.terms) > self.max_terms:
+                # 가장 오래된 용어 제거
+                self.terms.pop(next(iter(self.terms)))
+
+        # 주제 키워드 업데이트 (명사 위주)
+        nouns = re.findall(r'[가-힣]+/[nrv]', '') or re.findall(r'[가-힣]{2,6}', src_text)[:3]
+        if nouns:
+            self.topic_keywords = nouns[:5]
+
+    def build_context_summary(self) -> str:
+        """현재 대화 맥락 요약 생성 (프롬프트용)"""
+        parts = []
+
+        if self.terms:
+            term_list = ", ".join(f"{k}→{v}" for k, v in list(self.terms.items())[-10:])
+            parts.append(f"[핵심 용어] {term_list}")
+
+        if self.topic_keywords:
+            parts.append(f"[주제 키워드] {', '.join(self.topic_keywords)}")
+
+        if self.sentence_count > 0:
+            parts.append(f"[대화 진행] {self.sentence_count}번째 발화")
+
+        return "\n".join(parts) if parts else ""
+
+    def reset(self):
+        """대화 세션 초기화"""
+        self.terms.clear()
+        self.topic = ""
+        self.last_speaker = ""
+        self.topic_keywords.clear()
+        self.sentence_count = 0
+
+
+# 전역 문맥 관리자
+context_manager = ConversationContext(max_terms=20)
+
+# ─────────────────────────────────────────────
 # 오디오 장치 목록 표시
 # ─────────────────────────────────────────────
 def list_audio_devices() -> list[dict]:
@@ -320,36 +388,70 @@ def stt_worker(whisper: WhisperModel, worker_id: int):
 # - 여러 워커가 병렬로 번역 처리 가능
 # ─────────────────────────────────────────────
 def _build_context_prompt(src_text: str, src_lang: str) -> str:
-    """최근 번역 히스토리를 참조하여 문맥 인식 번역 프롬프트를 생성합니다."""
+    """대화 맥락을 고려한 문맥 인식 번역 프롬프트를 생성합니다."""
     lang_name = {"ja": "일본어", "en": "영어"}.get(src_lang, "외국어")
 
-    # 최근 히스토리 가져오기 (스레드 안전)
-    context_lines = []
+    # 스레드 안전으로 히스토리 복사
     with history_lock:
-        recent = history[:CONTEXT_HISTORY]  # 최신 N개 (역순으로 저장되어 있음)
-    
+        recent = history[:CONTEXT_HISTORY] if history else []
+
+    # 문맥 관리자의 요약 정보
+    context_summary = context_manager.build_context_summary()
+
+    # 자연스러운 번역을 위한 추가 지시
+    translation_rules = []
+
+    # 1. 생략된 주어/목적어 해결
     if recent:
-        # 시간순으로 정렬 (역순 → 정순)
+        translation_rules.append(
+            "• 앞 문장의 주어나 목적어가 생략된 경우, 이전 문장을 참고하여 누락된 정보를补完하세요."
+        )
+
+    # 2. 시제 연속성
+    if context_manager.sentence_count > 0:
+        translation_rules.append(
+            "• 시제가 일관되게 유지되도록 하세요.已完成的动作用'안다/받았다', 진행 중인 것은'하고 있다' 형태."
+        )
+
+    # 3. 핵심 용어 일관성
+    if context_manager.terms:
+        term_list = list(context_manager.terms.items())[-8:]
+        translation_rules.append(
+            f"• 아래 핵심 용어의 번역을 반드시 일관되게 적용하세요: {', '.join(f'{k}({v})' for k, v in term_list)}"
+        )
+
+    # 4. 존댓말/반말 톤
+    translation_rules.append(
+        "• 회의/통역 상황에서는 기본적으로 존댓말(~합니다, ~니다)을 사용하되, 친근한 분위기에서는 반말도 허용."
+    )
+
+    rules_text = "\n".join(translation_rules) if translation_rules else ""
+
+    if recent:
+        # 시간순 정렬 (오래된 → 최신)
         recent_ordered = list(reversed(recent))
         context_block = "\n".join(
-            f"  원문: {item['src']}\n  번역: {item['kr']}" 
+            f"  [{item['time']}] {item['src']} → {item['kr']}"
             for item in recent_ordered
         )
         prompt = (
-            f"당신은 실시간 동시통역사입니다. "
-            f"{lang_name}를 자연스러운 한국어로 번역해주세요.\n\n"
-            f"[최근 번역 히스토리 (문맥 참조용)]\n{context_block}\n\n"
-            f"위 히스토리의 흐름과 문맥을 이어받아, 아래 문장을 자연스럽게 번역하세요.\n"
-            f"앞 문장의 맥락을 고려하여 대화/내용의 흐름이 자연스럽게 이어지도록 해주세요.\n"
-            f"번역문만 출력하세요. 설명이나 원문 반복 없이 번역 결과만:\n\n"
+            f"당신은 전문 실시간 동시통역사입니다. {lang_name}를 자연스러운 한국어로 번역해주세요.\n\n"
+            f"[번역 규칙]\n{rules_text}\n\n"
+            f"[핵심 용어 데이터]\n{context_summary}\n\n"
+            f"[최근 대화 맥락]\n{context_block}\n\n"
+            f"위 대화의 흐름을 파악하고, 아래 문장을 자연스럽게 번역하세요.\n"
+            f"단어별로 따로 떼어 번역하지 말고, 전체 문장의 의미와 흐름을 고려하세요.\n"
+            f"번역은 결과만 출력하세요 (설명/주석 없음):\n\n"
             f"{src_text}"
         )
     else:
         prompt = (
-            f"다음 {lang_name}를 자연스러운 한국어로 번역해주세요. "
-            f"번역문만 출력하세요:\n\n{src_text}"
+            f"당신은 전문 동시통역사입니다. {lang_name}를 자연스러운 한국어로 번역해주세요.\n\n"
+            f"[번역 규칙]\n{rules_text}\n\n"
+            f"[핵심 용어 데이터]\n{context_summary}\n\n"
+            f"상황에 맞는 자연스러운 번역을 하고, 결과만 출력하세요:\n\n{src_text}"
         )
-    
+
     return prompt
 
 
@@ -398,6 +500,9 @@ def translate_worker(ollama: OllamaClient, worker_id: int):
                 })
                 if len(history) > MAX_HISTORY:
                     history.pop()
+
+            # 문맥 관리자에 새 번역 추가 (용어/주제 추적)
+            context_manager.add_translation(src_text, kr_text, src_lang)
 
             status_msg = "✅  번역 완료"
             time.sleep(0.3)
@@ -531,6 +636,20 @@ def select_language() -> str:
     return lang_map[choice]
 
 
+def ask_reset_context() -> bool:
+    """대화 문맥 초기화 여부를 묻습니다."""
+    console.print("\n[cyan]문맥 관리 옵션:[/cyan]")
+    console.print("  [bold]1[/bold]  🔄  새로운 대화 시작 (문맥 초기화)")
+    console.print("  [bold]2[/bold]  📚  이전 대화 이어서 (문맥 유지)")
+    console.print()
+    choice = Prompt.ask(
+        "[cyan]선택하세요[/cyan]",
+        default="2",
+        choices=["1", "2"],
+    )
+    return choice == "1"
+
+
 def main():
     global is_running, SOURCE_LANG
 
@@ -583,6 +702,13 @@ def main():
     SOURCE_LANG = select_language()
     lang_display = {"ja": "일본어 (JP)", "en": "영어 (EN)", "auto": "자동감지 (AUTO)"}.get(SOURCE_LANG, "?")
     console.print(f"[green]✓ 소스 언어: {lang_display}[/green]")
+
+    # 3-1. 문맥 초기화 여부
+    if ask_reset_context():
+        context_manager.reset()
+        console.print("[yellow]🔄 문맥이 초기화되었습니다. 새로운 대화를 시작합니다.[/yellow]")
+    else:
+        console.print("[dim]📚 이전 대화 문맥을 유지합니다.[/dim]")
 
     # 4. 오디오 장치 선택
     console.print(f"\n[cyan]4/4  오디오 장치 선택[/cyan]")
