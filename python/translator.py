@@ -56,7 +56,7 @@ WHISPER_MODEL = "small"       # tiny / base / small / medium
 OLLAMA_MODEL  = "aya-expanse:8b"  # ollama pull aya-expanse:8b
 OLLAMA_HOST   = "http://localhost:11434"
 MAX_HISTORY   = 15            # 표시할 최대 히스토리 수
-CONTEXT_HISTORY = 5           # 번역 시 문맥으로 참조할 최근 히스토리 수
+CONTEXT_HISTORY = 2           # 번역 시 문맥으로 참조할 최근 히스토리 수
 STT_WORKERS   = 1             # STT 워커 수 (CPU 기반이라 1개 권장)
 TRANSLATE_WORKERS = 2         # 번역 워커 수 (Ollama 응답 대기 동안 병렬 처리)
 SOURCE_LANG   = "ja"          # 소스 언어 (ja/en/auto)
@@ -487,12 +487,20 @@ def translate_worker(ollama: OllamaClient, worker_id: int):
                 logging.info(f"[번역-{worker_id}] 요청 중... (모델: {OLLAMA_MODEL}, 언어: {src_lang})")
                 logging.debug(f"[번역-{worker_id}] 프롬프트:\n{prompt}")
                 start_time = time.time()
-                response = ollama.chat(
+
+                # 스트리밍 응답으로 실시간 번역 결과 표시
+                kr_text = ""
+                current_kr = ""  # 초기화
+                for chunk in ollama.chat(
                     model=OLLAMA_MODEL,
                     messages=[{"role": "user", "content": prompt}],
+                    stream=True,
                     options={"temperature": 0.3},
-                )
-                kr_text = response["message"]["content"].strip()
+                ):
+                    if chunk["message"]["content"]:
+                        kr_text += chunk["message"]["content"]
+                        current_kr = kr_text  # 실시간 업데이트 → UI에 즉시 반영
+
                 elapsed = time.time() - start_time
                 logging.info(f"[번역-{worker_id}] 완료 ({elapsed:.1f}초): {kr_text}")
             except Exception as e:
