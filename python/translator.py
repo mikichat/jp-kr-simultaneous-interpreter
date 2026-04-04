@@ -57,11 +57,11 @@ OLLAMA_MODEL  = "aya-expanse:8b"  # ollama pull aya-expanse:8b
 OLLAMA_HOST   = "http://localhost:11434"
 MAX_HISTORY   = 15            # 표시할 최대 히스토리 수
 CONTEXT_HISTORY = 2           # 번역 시 문맥으로 참조할 최근 히스토리 수
-STT_WORKERS   = 1             # STT 워커 수 (CPU 기반이라 1개 권장)
+STT_WORKERS   = 2             # STT 워커 수 (CPU 기반이라 1개 권장)
 TRANSLATE_WORKERS = 2         # 번역 워커 수 (Ollama 응답 대기 동안 병렬 처리)
 SOURCE_LANG   = "ja"          # 소스 언어 (ja/en/auto)
 AUDIO_GAIN         = 4.0      # 오디오 증폭 배수 (1.0=원본, 2.0=2배 증폭, 3.0=3배, 4.0=4배)
-SILENCE_MULTIPLIER = 1.8      # 노이즈 플로어 대비 이 배수 이상이면 음성으로 판단 (2.0→1.8: 더 민감)
+SILENCE_MULTIPLIER = 1.5      # 노이즈 플로어 대비 이 배수 이상이면 음성으로 판단 (2.0→1.8: 더 민감)
 MIN_RMS_THRESHOLD  = 0.0003   # RMS 최소 임계값 (이 아래는 무조건 무음) - 0.0005→0.0003으로 하향
 VAD_MIN_SILENCE_MS = 500       # VAD 최소 무음 시간 (ms) - 200→500로 증가하여 짧은 음성 보호
 NOISE_FLOOR_DECAY  = 0.995     # 노이즈 플로어 감소율 (환경 변화 적응용, 0~1)
