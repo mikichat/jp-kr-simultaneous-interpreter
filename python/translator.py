@@ -54,7 +54,7 @@ SAMPLE_RATE  = 16000          # Whisper 권장 샘플레이트
 CHUNK_SEC    = 3              # 오디오 청크 단위 (초) - 긴 문장 처리를 위해 2→3
 CHANNELS     = 1              # 모노
 WHISPER_MODEL = "small"       # tiny / base / small / medium
-OLLAMA_MODEL  = "aya-expanse:8b"  # ollama pull aya-expanse:8b
+OLLAMA_MODEL  = "gemma4:e4b"     # gemma4:e4b / aya-expanse:8b
 OLLAMA_HOST   = "http://localhost:11434"
 
 # Minimax API 설정
@@ -781,17 +781,38 @@ def main():
             model_names = [m.model for m in models.models]
             console.print(f"[green]✓ 사용 가능한 모델: {', '.join(model_names)}[/green]")
 
+            # 모델 선택 메뉴
+            preset_models = ["gemma4:e4b", "aya-expanse:8b", "llama3.2:3b", "qwen2.5:3b"]
+            available_presets = [m for m in preset_models if any(m.split(":")[0] in n for n in model_names)]
+            if available_presets:
+                console.print("\n[cyan]사용 가능한 로컬 모델:[/cyan]")
+                for i, m in enumerate(available_presets, 1):
+                    default_marker = " (기본)" if m == OLLAMA_MODEL else ""
+                    console.print(f"  [bold]{i}[/bold]  {m}{default_marker}")
+
             if OLLAMA_MODEL not in model_names and not any(OLLAMA_MODEL.split(":")[0] in m for m in model_names):
                 console.print(
-                    f"[yellow]⚠️  모델 '{OLLAMA_MODEL}'을 찾을 수 없습니다.[/yellow]\n"
-                    f"[dim]  → 터미널에서: [bold]ollama pull {OLLAMA_MODEL}[/bold][/dim]\n"
-                    f"[dim]  → 또는 다른 모델 사용 (예: llama3.2, gemma3:4b)[/dim]"
+                    f"[yellow]⚠️  기본 모델 '{OLLAMA_MODEL}'을 찾을 수 없습니다.[/yellow]\n"
+                    f"[dim]  → 터미널에서: [bold]ollama pull {OLLAMA_MODEL}[/bold][/dim]"
                 )
-                alt = Prompt.ask(
-                    f"[cyan]사용할 모델명을 입력하세요[/cyan]",
-                    default=model_names[0] if model_names else OLLAMA_MODEL,
-                )
-                globals()["OLLAMA_MODEL"] = alt
+                if available_presets:
+                    choice = Prompt.ask(
+                        "[cyan]사용할 모델을 선택하세요[/cyan]",
+                        default="1",
+                    )
+                    try:
+                        idx = int(choice) - 1
+                        if 0 <= idx < len(available_presets):
+                            globals()["OLLAMA_MODEL"] = available_presets[idx]
+                    except ValueError:
+                        pass
+                else:
+                    alt = Prompt.ask(
+                        f"[cyan]사용할 모델명을 입력하세요[/cyan]",
+                        default=model_names[0] if model_names else OLLAMA_MODEL,
+                    )
+                    globals()["OLLAMA_MODEL"] = alt
+            console.print(f"[green]✓ 선택된 모델: {OLLAMA_MODEL}[/green]")
         except Exception as e:
             console.print(
                 f"[red]✗ Ollama 연결 실패: {e}[/red]\n"
