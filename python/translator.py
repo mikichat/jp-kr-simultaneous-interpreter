@@ -54,7 +54,7 @@ SAMPLE_RATE  = 16000          # Whisper 권장 샘플레이트
 CHUNK_SEC    = 3              # 오디오 청크 단위 (초) - 긴 문장 처리를 위해 2→3
 CHANNELS     = 1              # 모노
 WHISPER_MODEL = "small"       # tiny / base / small / medium
-OLLAMA_MODEL  = "gemma4:e4b"     # gemma4:e4b / aya-expanse:8b
+OLLAMA_MODEL  = "aya-expanse:8b"  # aya-expanse:8b / gemma4:e4b
 OLLAMA_HOST   = "http://localhost:11434"
 
 # Minimax API 설정
@@ -184,6 +184,27 @@ def list_audio_devices() -> list[dict]:
     return input_devices
 
 
+def test_device_audio(device_idx: int, duration: float = 3.0) -> float:
+    """장치에서 3초간 마이크 입력을监听하여 RMS 레벨 측정."""
+    try:
+        import threading
+        level_holder = [0.0]
+
+        def callback(indata, frames, time_info, status):
+            if status:
+                return
+            rms = np.sqrt(np.mean(indata**2))
+            if rms > level_holder[0]:
+                level_holder[0] = rms
+
+        with sd.InputStream(device=device_idx, channels=CHANNELS,
+                           samplerate=SAMPLE_RATE, callback=callback):
+            sd.sleep(int(duration * 1000))
+        return level_holder[0]
+    except Exception:
+        return 0.0
+
+
 def select_device() -> int:
     """사용자가 오디오 장치를 선택합니다."""
     devices = list_audio_devices()
@@ -192,6 +213,7 @@ def select_device() -> int:
     table.add_column("번호", style="bold cyan", width=6)
     table.add_column("장치명", style="white")
     table.add_column("Host API", style="dim")
+    table.add_column("레벨", style="dim", width=10)
 
     # WASAPI Loopback 장치 강조 (PC 사운드 캡처용)
     loopback_idx = None
@@ -207,14 +229,26 @@ def select_device() -> int:
             str(d["index"]),
             f"{'🔊 ' if is_loopback else ''}{d['name']}",
             d["hostapi"],
+            "▓▓▓▓▓▓▓▓▓▓",
             style=style,
         )
         if is_loopback and loopback_idx is None:
             loopback_idx = d["index"]
 
     console.print(table)
+    console.print("[cyan]🔊 각 장치에서 3초간 테스트 사운드 출력 중...[/cyan]")
+
+    # 각 장치 테스트
+    device_levels = {}
+    for d in devices:
+        console.print(f"  [{d['index']}] {d['name'][:40]}... 테스트 중...", end="", style="dim")
+        level = test_device_audio(d["index"], duration=3.0)
+        device_levels[d["index"]] = level
+        bar = "█" * int(level * 30)
+        console.print(f" {bar or '·'} ({level:.3f})", style="green" if level > 0.01 else "dim")
+
     console.print(
-        "[dim]💡 PC에서 재생되는 소리 캡처: "
+        "\n[dim]💡 PC에서 재생되는 소리 캡처: "
         "[bold green]🔊 표시된 Loopback / 스테레오 믹스[/] 장치 선택[/dim]\n"
     )
 
