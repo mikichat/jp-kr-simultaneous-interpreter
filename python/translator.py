@@ -67,7 +67,7 @@ MAX_HISTORY   = 15            # 표시할 최대 히스토리 수
 CONTEXT_HISTORY = 2           # 번역 시 문맥으로 참조할 최근 히스토리 수
 STT_WORKERS   = 2             # STT 워커 수 (CPU 기반이라 1개 권장)
 TRANSLATE_WORKERS = 2         # 번역 워커 수 (Ollama/Minimax 응답 대기 동안 병렬 처리)
-SOURCE_LANG   = "ja"          # 소스 언어 (ja/en/auto)
+SOURCE_LANG   = "ja"          # 소스 언어 (ja/en/zh/auto)
 AUDIO_GAIN         = 4.0      # 오디오 증폭 배수 (1.0=원본, 2.0=2배 증폭, 3.0=3배, 4.0=4배)
 SILENCE_MULTIPLIER = 1.5      # 노이즈 플로어 대비 이 배수 이상이면 음성으로 판단 (2.0→1.8: 더 민감)
 MIN_RMS_THRESHOLD  = 0.0003   # RMS 최소 임계값 (이 아래는 무조건 무음) - 0.0005→0.0003으로 하향
@@ -384,7 +384,7 @@ def stt_worker(whisper: WhisperModel, worker_id: int):
 
             try:
                 lang_param = SOURCE_LANG if SOURCE_LANG != "auto" else None
-                lang_label = {"ja": "일본어", "en": "영어"}.get(SOURCE_LANG, "자동감지")
+                lang_label = {"ja": "일본어", "en": "영어", "zh": "중국어"}.get(SOURCE_LANG, "자동감지")
                 logging.info(f"[STT-{worker_id}] Whisper 음성인식 시작... (언어: {lang_label})")
                 start_time = time.time()
                 transcribe_kwargs = {
@@ -447,7 +447,7 @@ def stt_worker(whisper: WhisperModel, worker_id: int):
 # ─────────────────────────────────────────────
 def _build_context_prompt(src_text: str, src_lang: str) -> str:
     """대화 맥락을 고려한 문맥 인식 번역 프롬프트를 생성합니다."""
-    lang_name = {"ja": "일본어", "en": "영어"}.get(src_lang, "외국어")
+    lang_name = {"ja": "일본어", "en": "영어", "zh": "중국어"}.get(src_lang, "외국어")
 
     # 스레드 안전으로 히스토리 복사
     with history_lock:
@@ -606,7 +606,7 @@ def translate_worker(ollama: "OllamaClient | None", worker_id: int):
             error_msg = ""
 
             # 히스토리 추가 (스레드 안전)
-            lang_flag = {"ja": "🇯🇵", "en": "🇺🇸"}.get(src_lang, "🌐")
+            lang_flag = {"ja": "🇯🇵", "en": "🇺🇸", "zh": "🇨🇳"}.get(src_lang, "🌐")
             with history_lock:
                 history.insert(0, {
                     "time": datetime.now().strftime("%H:%M:%S"),
@@ -647,8 +647,8 @@ def build_ui() -> Layout:
     )
 
     # 헤더 - 소스 언어 표시
-    lang_display = {"ja": "JP", "en": "EN", "auto": "AUTO"}.get(SOURCE_LANG, "?")
-    lang_flag = {"ja": "🎌", "en": "🇺🇸", "auto": "🌐"}.get(SOURCE_LANG, "🌐")
+    lang_display = {"ja": "JP", "en": "EN", "zh": "CN", "auto": "AUTO"}.get(SOURCE_LANG, "?")
+    lang_flag = {"ja": "🎌", "en": "🇺🇸", "zh": "🇨🇳", "auto": "🌐"}.get(SOURCE_LANG, "🌐")
     backend_name = "Minimax API" if USE_MINIMAX else "Ollama (Local)"
     header_text = Text()
     header_text.append(f"{lang_flag} ", style="bold red")
@@ -662,8 +662,8 @@ def build_ui() -> Layout:
     )
 
     # 현재 번역 결과
-    src_title_map = {"ja": "[bold red]🇯🇵 日本語[/bold red]", "en": "[bold green]🇺🇸 English[/bold green]", "auto": "[bold yellow]🌐 원문 (자동감지)[/bold yellow]"}
-    src_style_map = {"ja": "red", "en": "green", "auto": "yellow"}
+    src_title_map = {"ja": "[bold red]🇯🇵 日本語[/bold red]", "en": "[bold green]🇺🇸 English[/bold green]", "zh": "[bold yellow]🇨🇳 中文[/bold yellow]", "auto": "[bold yellow]🌐 원문 (자동감지)[/bold yellow]"}
+    src_style_map = {"ja": "red", "en": "green", "zh": "yellow", "auto": "yellow"}
     src_panel = Panel(
         Text(current_src or "[dim]음성 대기 중...[/dim]", no_wrap=False),
         title=src_title_map.get(SOURCE_LANG, "[bold]원문[/bold]"),
@@ -698,7 +698,7 @@ def build_ui() -> Layout:
         for item in history:
             flag = item.get("flag", "🌐")
             lang = item.get("lang", "?")
-            src_style = "red" if lang == "ja" else ("green" if lang == "en" else "white")
+            src_style = "red" if lang == "ja" else ("green" if lang == "en" else ("yellow" if lang == "zh" else "white"))
             hist_table.add_row(
                 item["time"],
                 flag,
@@ -744,14 +744,15 @@ def select_language() -> str:
     console.print("\n[cyan]소스 언어를 선택하세요:[/cyan]")
     console.print("  [bold]1[/bold]  🎌  일본어 (JP → KR)")
     console.print("  [bold]2[/bold]  🇺🇸  영어   (EN → KR)")
-    console.print("  [bold]3[/bold]  🌐  자동감지 (AUTO → KR)")
+    console.print("  [bold]3[/bold]  🇨🇳  중국어 (CN → KR)")
+    console.print("  [bold]4[/bold]  🌐  자동감지 (AUTO → KR)")
     console.print()
     choice = Prompt.ask(
         "[cyan]번호를 입력하세요[/cyan]",
         default="1",
-        choices=["1", "2", "3"],
+        choices=["1", "2", "3", "4"],
     )
-    lang_map = {"1": "ja", "2": "en", "3": "auto"}
+    lang_map = {"1": "ja", "2": "en", "3": "zh", "4": "auto"}
     return lang_map[choice]
 
 
@@ -874,7 +875,7 @@ def main():
 
     # 4. 소스 언어 선택
     SOURCE_LANG = select_language()
-    lang_display = {"ja": "일본어 (JP)", "en": "영어 (EN)", "auto": "자동감지 (AUTO)"}.get(SOURCE_LANG, "?")
+    lang_display = {"ja": "일본어 (JP)", "en": "영어 (EN)", "zh": "중국어 (CN)", "auto": "자동감지 (AUTO)"}.get(SOURCE_LANG, "?")
     console.print(f"[green]✓ 소스 언어: {lang_display}[/green]")
 
     # 4-1. 문맥 초기화 여부
