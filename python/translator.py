@@ -395,33 +395,21 @@ def command_handler():
     """메인 루프와 별개로 사용자 명령을 처리합니다. D=장치변경, M=모델변경"""
     global is_running
 
+    import readchar
+
     while is_running:
         try:
-            if sys.platform == "win32":
-                import msvcrt
-                if msvcrt.kbhit():
-                    key = msvcrt.getch()
-                    if key == b'q' or key == b'Q':
-                        is_running = False
-                        break
-                    elif key == b'd' or key == b'D':
-                        # 장치 변경 요청
-                        command_queue.put("change_device")
-                    elif key == b'm' or key == b'M':
-                        # 모델 변경 요청 (Ollama 모드에서만)
-                        if not USE_MINIMAX:
-                            command_queue.put("change_model")
-            else:
-                import select as sel
-                if sel.select([sys.stdin], [], [], 0.1)[0]:
-                    char = sys.stdin.read(1)
-                    if char in ('q', 'Q'):
-                        is_running = False
-                        break
-                    elif char in ('d', 'D'):
-                        command_queue.put("change_device")
-                    elif char in ('m', 'M') and not USE_MINIMAX:
-                        command_queue.put("change_model")
+            # readchar은 screen mode에서도 키 입력을 감지합니다
+            key = readchar.readchar()
+            if key in ('q', 'Q'):
+                is_running = False
+                break
+            elif key in ('d', 'D'):
+                # 장치 변경 요청
+                command_queue.put("change_device")
+            elif key in ('m', 'M') and not USE_MINIMAX:
+                # 모델 변경 요청 (Ollama 모드에서만)
+                command_queue.put("change_model")
         except Exception:
             pass
 

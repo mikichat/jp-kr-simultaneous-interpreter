@@ -4,3 +4,4 @@ faster-whisper
 ollama
 rich
 httpx
+readchar
