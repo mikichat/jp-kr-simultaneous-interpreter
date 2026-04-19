@@ -26,12 +26,10 @@ if not exist "python\venv\Scripts\activate.bat" (
 
 call python\venv\Scripts\activate.bat
 
-python -c "import faster_whisper" >nul 2>&1
+pip -q -r python\requirements.txt >nul 2>&1
 if %errorlevel% neq 0 (
     echo [INFO] Installing required packages...
-    pip install --quiet -r python\requirements.txt
-    pip install --quiet faster-whisper httpx
-    echo [INFO] Packages installed.
+    pip install -r python\requirements.txt
 )
 
 echo.
