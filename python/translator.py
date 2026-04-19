@@ -22,6 +22,7 @@ import sys
 import signal
 from datetime import datetime
 import logging
+import os
 
 # ────────── 로깅 설정 ──────────
 logging.basicConfig(
@@ -60,14 +61,14 @@ OLLAMA_HOST   = "http://localhost:11434"
 # Minimax API 설정
 USE_MINIMAX = False           # True로 설정하면 Minimax API 사용
 MINIMAX_API_KEY = ""          # Minimax API 키 (환경변수 MINIMAX_API_KEY也可)
-MINIMAX_BASE_URL = "https://api.minimax.chat/v1"
-MINIMAX_MODEL = "Minimax-Text-01"  # Minimax 모델명
+MINIMAX_BASE_URL = "https://api.minimax.io/v1"
+MINIMAX_MODEL = "M2-her"  # Minimax 모델명
 
 MAX_HISTORY   = 15            # 표시할 최대 히스토리 수
-STT_WORKERS   = 2             # STT 워커 수 (CPU 기반이라 1개 권장)
-TRANSLATE_WORKERS = 2         # 번역 워커 수 (Ollama/Minimax 응답 대기 동안 병렬 처리)
+STT_WORKERS   = 1             # STT 워커 수 (CPU 기반이라 1개 권장)
+TRANSLATE_WORKERS = 1         # 번역 워커 수 (Ollama/Minimax 응답 대기 동안 병렬 처리)
 SOURCE_LANG   = "ja"          # 소스 언어 (ja/en/zh/auto)
-AUDIO_GAIN         = 4.0      # 오디오 증폭 배수 (1.0=원본, 2.0=2배 증폭, 3.0=3배, 4.0=4배)
+AUDIO_GAIN         = 2.0      # 오디오 증폭 배수 (1.0=원본, 2.0=2배 증폭, 3.0=3배, 4.0=4배)
 SILENCE_MULTIPLIER = 1.5      # 노이즈 플로어 대비 이 배수 이상이면 음성으로 판단 (2.0→1.8: 더 민감)
 MIN_RMS_THRESHOLD  = 0.0003   # RMS 최소 임계값 (이 아래는 무조건 무음) - 0.0005→0.0003으로 하향
 VAD_MIN_SILENCE_MS = 200       # VAD 최소 무음 시간 (ms) - 500→200으로 단축하여 실시간성 향상
@@ -98,6 +99,16 @@ translate_pending = 0  # 번역 대기 중인 텍스트 수
 error_msg = ""
 noise_floor = 0.0     # 적응형 노이즈 플로어 (자동 측정)
 current_rms = 0.0     # 현재 RMS (UI 표시용)
+
+# 런타임 변경용 전역 변수
+current_device_idx: int = 0       # 현재 오디오 장치 인덱스
+current_ollama_model: str = OLLAMA_MODEL  # 현재 Ollama 모델
+ollama_client: "OllamaClient | None" = None  # Ollama 클라이언트 (런타임 변경 시 재연결용)
+audio_stream: "sd.InputStream | None" = None  # 현재 오디오 스트림
+stream_lock = threading.Lock()  # 스트림 변경용 잠금
+
+# 명령 큐 (런타임 변경 명령)
+command_queue: "queue.Queue[str]" = queue.Queue()
 
 # ─────────────────────────────────────────────
 # 오디오 장치 목록 표시
@@ -294,6 +305,196 @@ def audio_collector():
 
 
 # ─────────────────────────────────────────────
+# [런타임 변경] 오디오 장치 변경
+# ─────────────────────────────────────────────
+def change_audio_device(new_device_idx: int) -> bool:
+    """오디오 장치를 변경하고 스트림을 다시 시작합니다."""
+    global current_device_idx, audio_stream
+
+    try:
+        dev_info = sd.query_devices(new_device_idx)
+        device_name = dev_info['name']
+        logging.info(f"[장치 변경] {current_device_idx} → {new_device_idx} ({device_name})")
+
+        with stream_lock:
+            # 기존 스트림 닫기
+            if audio_stream is not None:
+                audio_stream.close()
+                audio_stream = None
+
+            # 새 스트림 생성 (audio_callback은 기존 것을 사용)
+            audio_stream = sd.InputStream(
+                device=new_device_idx,
+                channels=CHANNELS,
+                samplerate=SAMPLE_RATE,
+                callback=audio_callback,
+                blocksize=int(SAMPLE_RATE * 0.1),
+            )
+            audio_stream.start()
+            current_device_idx = new_device_idx
+
+        console.print(f"[green]✓ 오디오 장치 변경 완료: {device_name}[/green]")
+        logging.info(f"[장치 변경 완료] {device_name}")
+        return True
+    except Exception as e:
+        logging.error(f"[장치 변경 실패] {e}")
+        console.print(f"[red]✗ 장치 변경 실패: {e}[/red]")
+        return False
+
+
+# ─────────────────────────────────────────────
+# [런타임 변경] Ollama 모델 변경
+# ─────────────────────────────────────────────
+def change_ollama_model(new_model: str) -> bool:
+    """Ollama 모델을 변경합니다."""
+    global current_ollama_model, ollama_client
+
+    try:
+        # 새 모델로 연결 테스트
+        test_client = OllamaClient(host=OLLAMA_HOST)
+        test_client.chat(
+            model=new_model,
+            messages=[{"role": "user", "content": "test"}],
+            stream=False,
+        )
+        current_ollama_model = new_model
+        ollama_client = test_client
+        console.print(f"[green]✓ Ollama 모델 변경 완료: {new_model}[/green]")
+        logging.info(f"[모델 변경 완료] {new_model}")
+        return True
+    except Exception as e:
+        logging.error(f"[모델 변경 실패] {e}")
+        console.print(f"[red]✗ 모델 변경 실패: {e}[/red]")
+        return False
+
+
+# ─────────────────────────────────────────────
+# [런타임 변경] 명령 핸들러 스레드
+# ─────────────────────────────────────────────
+def command_handler():
+    """메인 루프와 별개로 사용자 명령을 처리합니다. D=장치변경, M=모델변경"""
+    global is_running
+
+    while is_running:
+        try:
+            if sys.platform == "win32":
+                import msvcrt
+                if msvcrt.kbhit():
+                    key = msvcrt.getch()
+                    if key == b'q' or key == b'Q':
+                        is_running = False
+                        break
+                    elif key == b'd' or key == b'D':
+                        # 장치 변경 요청
+                        command_queue.put("change_device")
+                    elif key == b'm' or key == b'M':
+                        # 모델 변경 요청 (Ollama 모드에서만)
+                        if not USE_MINIMAX:
+                            command_queue.put("change_model")
+            else:
+                import select as sel
+                if sel.select([sys.stdin], [], [], 0.1)[0]:
+                    char = sys.stdin.read(1)
+                    if char in ('q', 'Q'):
+                        is_running = False
+                        break
+                    elif char in ('d', 'D'):
+                        command_queue.put("change_device")
+                    elif char in ('m', 'M') and not USE_MINIMAX:
+                        command_queue.put("change_model")
+        except Exception:
+            pass
+
+        # command_queue에서 명령 처리
+        try:
+            cmd = command_queue.get(timeout=0.1)
+            if cmd == "change_device":
+                handle_device_change()
+            elif cmd == "change_model":
+                handle_model_change()
+        except queue.Empty:
+            pass
+
+
+def handle_device_change():
+    """오디오 장치 변경 처리 (Live UI 일시 중단 후 실행)"""
+    global is_running
+
+    # Live UI가 처리 중인지 확인하고 잠시 대기
+    console.print("\n[cyan]═══ 오디오 장치 변경 ═══[/cyan]")
+    devices = list_audio_devices()
+
+    table = Table(title="🎙️  오디오 입력 장치 목록", box=box.ROUNDED, border_style="cyan")
+    table.add_column("번호", style="bold cyan", width=6)
+    table.add_column("장치명", style="white")
+    table.add_column("Host API", style="dim")
+
+    for d in devices:
+        is_current = d["index"] == current_device_idx
+        style = "bold green" if is_current else ""
+        marker = " ◀현재" if is_current else ""
+        table.add_row(
+            str(d["index"]),
+            f"{d['name']}{marker}",
+            d["hostapi"],
+            style=style,
+        )
+
+    console.print(table)
+    choice = Prompt.ask(
+        "[cyan]새 장치 번호를 입력하세요 (취소: Enter)[/cyan]",
+        default="",
+    )
+
+    if choice.strip():
+        try:
+            new_idx = int(choice.strip())
+            change_audio_device(new_idx)
+        except ValueError:
+            console.print("[red]✗ 잘못된 번호입니다.[/red]")
+    console.print("[cyan]═════════════════════════[/cyan]\n")
+
+
+def handle_model_change():
+    """Ollama 모델 변경 처리 (Live UI 일시 중단 후 실행)"""
+    global is_running
+
+    if USE_MINIMAX:
+        return
+
+    console.print("\n[cyan]═══ Ollama 모델 변경 ═══[/cyan]")
+    try:
+        ollama = OllamaClient(host=OLLAMA_HOST)
+        models = ollama.list()
+        model_names = [m.model for m in models.models]
+
+        console.print("[cyan]사용 가능한 모델:[/cyan]")
+        for i, m in enumerate(model_names, 1):
+            is_current = m == current_ollama_model
+            marker = " ◀현재" if is_current else ""
+            console.print(f"  [bold]{i}[/bold]  {m}{marker}")
+
+        choice = Prompt.ask(
+            "\n[cyan]새 모델 번호를 입력하세요 (취소: Enter)[/cyan]",
+            default="",
+        )
+
+        if choice.strip():
+            try:
+                idx = int(choice.strip()) - 1
+                if 0 <= idx < len(model_names):
+                    new_model = model_names[idx]
+                    change_ollama_model(new_model)
+                else:
+                    console.print("[red]✗ 잘못된 번호입니다.[/red]")
+            except ValueError:
+                console.print("[red]✗ 잘못된 입력입니다.[/red]")
+    except Exception as e:
+        console.print(f"[red]✗ 모델 목록 조회 실패: {e}[/red]")
+    console.print("[cyan]═════════════════════════[/cyan]\n")
+
+
+# ─────────────────────────────────────────────
 # [파이프라인 2단계] STT 워커
 # - stt_queue에서 오디오를 꺼내 Whisper로 텍스트 변환
 # - 결과를 translate_queue에 전달
@@ -426,8 +627,8 @@ def translate_with_minimax(prompt: str) -> str:
     return kr_text
 
 
-def translate_worker(ollama: "OllamaClient | None", worker_id: int):
-    global current_kr, status_msg, translate_pending, error_msg
+def translate_worker(_worker_id: int):
+    global current_kr, status_msg, translate_pending, error_msg, ollama_client, current_ollama_model
 
     while is_running:
         try:
@@ -439,8 +640,9 @@ def translate_worker(ollama: "OllamaClient | None", worker_id: int):
 
             try:
                 prompt = _build_prompt(src_text, src_lang)
-                logging.info(f"[번역-{worker_id}] 요청 중... (백엔드: {'Minimax' if USE_MINIMAX else 'Ollama'}, 언어: {src_lang})")
-                logging.debug(f"[번역-{worker_id}] 프롬프트:\n{prompt}")
+                model_name = "Minimax" if USE_MINIMAX else current_ollama_model
+                logging.info(f"[번역-{_worker_id}] 요청 중... (백엔드: {model_name}, 언어: {src_lang})")
+                logging.debug(f"[번역-{_worker_id}] 프롬프트:\n{prompt}")
                 start_time = time.time()
 
                 # 스트리밍 응답으로 실시간 번역 결과 표시
@@ -452,8 +654,8 @@ def translate_worker(ollama: "OllamaClient | None", worker_id: int):
                         kr_text += chunk
                         current_kr = kr_text
                 else:
-                    for chunk in ollama.chat(
-                        model=OLLAMA_MODEL,
+                    for chunk in ollama_client.chat(
+                        model=current_ollama_model,
                         messages=[{"role": "user", "content": prompt}],
                         stream=True,
                         options={"temperature": 0.3},
@@ -463,10 +665,10 @@ def translate_worker(ollama: "OllamaClient | None", worker_id: int):
                             current_kr = kr_text  # 실시간 업데이트 → UI에 즉시 반영
 
                 elapsed = time.time() - start_time
-                logging.info(f"[번역-{worker_id}] 완료 ({elapsed:.1f}초): {kr_text}")
+                logging.info(f"[번역-{_worker_id}] 완료 ({elapsed:.1f}초): {kr_text}")
             except Exception as e:
                 error_msg = f"번역 오류: {e}"
-                logging.error(f"[번역-{worker_id} 오류] {e}")
+                logging.error(f"[번역-{_worker_id} 오류] {e}")
                 status_msg = "대기 중"
                 continue
 
@@ -589,9 +791,12 @@ def build_ui() -> Layout:
     status_line.append(f"  |  청크: {chunk_count}", style="dim")
     status_line.append(f"  |  STT: {stt_pending}", style="cyan")
     status_line.append(f"  |  번역: {translate_pending}", style="magenta")
+    if not USE_MINIMAX:
+        status_line.append(f"  |  모델: [yellow]{current_ollama_model}[/yellow]", style="dim")
+    status_line.append(f"  |  장치: [yellow]{current_device_idx}[/yellow]", style="dim")
     if error_msg:
         status_line.append(f"  ⚠️  {error_msg}", style="bold red")
-    status_line.append("  |  종료: [bold]Ctrl+C[/bold]", style="dim")
+    status_line.append("  |  [D]장치  [M]모델  |  종료: [bold]Ctrl+C[/bold]", style="dim")
 
     layout["footer"].update(
         Panel(status_line, border_style="dim", padding=(0, 1))
@@ -726,6 +931,13 @@ def main():
     dev_info = sd.query_devices(device_idx)
     device_name = dev_info['name']
     console.print(f"[green]✓ 선택된 장치: {device_name}[/green]\n")
+
+    # 전역 변수 설정 (런타임 변경용)
+    global current_device_idx, current_ollama_model, ollama_client
+    current_device_idx = device_idx
+    current_ollama_model = OLLAMA_MODEL
+    ollama_client = ollama if not USE_MINIMAX else None
+
     logging.info(f"--- 프로그램 시작 (비동기 파이프라인) ---")
     logging.info(f"번역 백엔드: {'Minimax API' if USE_MINIMAX else 'Ollama'}")
     logging.info(f"소스 언어: {lang_display}")
@@ -757,12 +969,12 @@ def main():
         t.start()
         stt_threads.append(t)
 
-    # 3단계: 번역 워커 (병렬)
+    # 3단계: 번역 워커 (병렬) - 전역 ollama_client 사용
     translate_threads = []
     for i in range(TRANSLATE_WORKERS):
         t = threading.Thread(
             target=translate_worker,
-            args=(ollama, i),
+            args=(i,),
             daemon=True,
             name=f"Translate-{i}",
         )
@@ -783,19 +995,47 @@ def main():
 
     signal.signal(signal.SIGINT, stop)
 
+    # 4단계: 명령 핸들러 스레드 (D=장치변경, M=모델변경)
+    cmd_thread = threading.Thread(
+        target=command_handler,
+        daemon=True,
+        name="CommandHandler",
+    )
+    cmd_thread.start()
+
     # 오디오 스트림 + Live UI
     try:
-        with sd.InputStream(
+        global audio_stream
+        audio_stream = sd.InputStream(
             device=device_idx,
             channels=CHANNELS,
             samplerate=SAMPLE_RATE,
             callback=audio_callback,
-            blocksize=int(SAMPLE_RATE * 0.1),  # 100ms 블록
-        ):
-            with Live(build_ui(), refresh_per_second=4, screen=True, console=console) as live:
-                while is_running:
-                    live.update(build_ui())
-                    time.sleep(0.25)
+            blocksize=int(SAMPLE_RATE * 0.1),
+        )
+        audio_stream.start()
+
+        with Live(build_ui(), refresh_per_second=4, screen=True, console=console) as live:
+            while is_running:
+                # command_queue에 장치/모델 변경 요청이 있는지 확인
+                try:
+                    cmd = command_queue.get_nowait()
+                    # Live 일시 중단 후 처리
+                    live.stop()
+                    if cmd == "change_device":
+                        handle_device_change()
+                    elif cmd == "change_model":
+                        handle_model_change()
+                    # Live 재개
+                    live.start()
+                except queue.Empty:
+                    pass
+
+                live.update(build_ui())
+                time.sleep(0.25)
+
+        audio_stream.close()
+        audio_stream = None
     except sd.PortAudioError as e:
         console.print(f"[red]오디오 스트림 오류: {e}[/red]")
         if "Invalid sample rate" in str(e):
