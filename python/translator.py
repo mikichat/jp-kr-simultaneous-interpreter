@@ -219,7 +219,9 @@ def select_device() -> int:
 def audio_callback(indata: np.ndarray, frames: int, time_info, status):
     if status:
         pass  # 오버플로 등 무시
-    audio_queue.put(indata.copy())
+    with stream_lock:
+        if audio_stream is not None:
+            audio_queue.put(indata.copy())
 
 
 # ─────────────────────────────────────────────
@@ -308,7 +310,7 @@ def audio_collector():
 # [런타임 변경] 오디오 장치 변경
 # ─────────────────────────────────────────────
 def change_audio_device(new_device_idx: int) -> bool:
-    """오디오 장치를 변경하고 스트림을 다시 시작합니다."""
+    """오디오 장치를 변경하고 스트림을 다시 시작합니다. 번역 중에도 호출 가능."""
     global current_device_idx, audio_stream
 
     try:
@@ -316,13 +318,16 @@ def change_audio_device(new_device_idx: int) -> bool:
         device_name = dev_info['name']
         logging.info(f"[장치 변경] {current_device_idx} → {new_device_idx} ({device_name})")
 
+        # 스트림 잠금으로 콜백 보호しながら 장치 교체
         with stream_lock:
-            # 기존 스트림 닫기
+            # 기존 스트림 닫기 (콜백 실행 중이면 완료까지 대기)
             if audio_stream is not None:
-                audio_stream.close()
-                audio_stream = None
+                old_stream = audio_stream
+                audio_stream = None  # 먼저 None 설정하여 콜백 무효화
+                old_stream.close()
+                logging.info("[장치 변경] 기존 스트림 닫기 완료")
 
-            # 새 스트림 생성 (audio_callback은 기존 것을 사용)
+            # 새 스트림 생성
             audio_stream = sd.InputStream(
                 device=new_device_idx,
                 channels=CHANNELS,
@@ -332,6 +337,7 @@ def change_audio_device(new_device_idx: int) -> bool:
             )
             audio_stream.start()
             current_device_idx = new_device_idx
+            logging.info(f"[장치 변경] 새 스트림 시작: {device_name}")
 
         console.print(f"[green]✓ 오디오 장치 변경 완료: {device_name}[/green]")
         logging.info(f"[장치 변경 완료] {device_name}")
@@ -339,6 +345,20 @@ def change_audio_device(new_device_idx: int) -> bool:
     except Exception as e:
         logging.error(f"[장치 변경 실패] {e}")
         console.print(f"[red]✗ 장치 변경 실패: {e}[/red]")
+        # 실패 시에도 스트림 복원 시도
+        try:
+            with stream_lock:
+                if audio_stream is None:
+                    audio_stream = sd.InputStream(
+                        device=current_device_idx,
+                        channels=CHANNELS,
+                        samplerate=SAMPLE_RATE,
+                        callback=audio_callback,
+                        blocksize=int(SAMPLE_RATE * 0.1),
+                    )
+                    audio_stream.start()
+        except:
+            pass
         return False
 
 
