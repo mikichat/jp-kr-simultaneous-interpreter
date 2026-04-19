@@ -810,37 +810,29 @@ def main():
             model_names = [m.model for m in models.models]
             console.print(f"[green]✓ 사용 가능한 모델: {', '.join(model_names)}[/green]")
 
-            # 모델 선택 메뉴
-            preset_models = ["gemma4:e4b", "aya-expanse:8b", "llama3.2:3b", "qwen2.5:3b"]
-            available_presets = [m for m in preset_models if any(m.split(":")[0] in n for n in model_names)]
-            if available_presets:
-                console.print("\n[cyan]사용 가능한 로컬 모델:[/cyan]")
-                for i, m in enumerate(available_presets, 1):
-                    default_marker = " (기본)" if m == OLLAMA_MODEL else ""
-                    console.print(f"  [bold]{i}[/bold]  {m}{default_marker}")
+            # 전체 모델 목록에서 선택
+            console.print("\n[cyan]사용 가능한 로컬 모델 목록:[/cyan]")
+            for i, m in enumerate(model_names, 1):
+                default_marker = " (기본)" if m == OLLAMA_MODEL else ""
+                console.print(f"  [bold]{i}[/bold]  {m}{default_marker}")
 
-            if OLLAMA_MODEL not in model_names and not any(OLLAMA_MODEL.split(":")[0] in m for m in model_names):
-                console.print(
-                    f"[yellow]⚠️  기본 모델 '{OLLAMA_MODEL}'을 찾을 수 없습니다.[/yellow]\n"
-                    f"[dim]  → 터미널에서: [bold]ollama pull {OLLAMA_MODEL}[/bold][/dim]"
-                )
-                if available_presets:
-                    choice = Prompt.ask(
-                        "[cyan]사용할 모델을 선택하세요[/cyan]",
-                        default="1",
-                    )
-                    try:
-                        idx = int(choice) - 1
-                        if 0 <= idx < len(available_presets):
-                            globals()["OLLAMA_MODEL"] = available_presets[idx]
-                    except ValueError:
-                        pass
+            # 모델 선택
+            choice = Prompt.ask(
+                "\n[cyan]사용할 모델 번호를 선택하세요[/cyan]",
+                default="1",
+            )
+            try:
+                idx = int(choice) - 1
+                if 0 <= idx < len(model_names):
+                    globals()["OLLAMA_MODEL"] = model_names[idx]
                 else:
-                    alt = Prompt.ask(
-                        f"[cyan]사용할 모델명을 입력하세요[/cyan]",
-                        default=model_names[0] if model_names else OLLAMA_MODEL,
-                    )
-                    globals()["OLLAMA_MODEL"] = alt
+                    console.print(f"[yellow]잘못된 번호입니다. 기본값({OLLAMA_MODEL})을 사용합니다.[/yellow]")
+            except ValueError:
+                if choice.strip() in model_names:
+                    globals()["OLLAMA_MODEL"] = choice.strip()
+                else:
+                    console.print(f"[yellow]잘못된 입력입니다. 기본값({OLLAMA_MODEL})을 사용합니다.[/yellow]")
+
             console.print(f"[green]✓ 선택된 모델: {OLLAMA_MODEL}[/green]")
         except Exception as e:
             console.print(
