@@ -51,7 +51,7 @@ from rich.prompt import Prompt
 # 설정
 # ─────────────────────────────────────────────
 SAMPLE_RATE  = 16000          # Whisper 권장 샘플레이트
-CHUNK_SEC    = 3              # 오디오 청크 단위 (초) - 긴 문장 처리를 위해 2→3
+CHUNK_SEC    = 1              # 오디오 청크 단위 (초) - 실시간성을 위해 3→1로 단축
 CHANNELS     = 1              # 모노
 WHISPER_MODEL = "small"       # tiny / base / small / medium
 OLLAMA_MODEL  = "aya-expanse:8b"  # aya-expanse:8b / gemma4:e4b
@@ -71,7 +71,8 @@ SOURCE_LANG   = "ja"          # 소스 언어 (ja/en/zh/auto)
 AUDIO_GAIN         = 4.0      # 오디오 증폭 배수 (1.0=원본, 2.0=2배 증폭, 3.0=3배, 4.0=4배)
 SILENCE_MULTIPLIER = 1.5      # 노이즈 플로어 대비 이 배수 이상이면 음성으로 판단 (2.0→1.8: 더 민감)
 MIN_RMS_THRESHOLD  = 0.0003   # RMS 최소 임계값 (이 아래는 무조건 무음) - 0.0005→0.0003으로 하향
-VAD_MIN_SILENCE_MS = 500       # VAD 최소 무음 시간 (ms) - 200→500로 증가하여 짧은 음성 보호
+VAD_MIN_SILENCE_MS = 200       # VAD 최소 무음 시간 (ms) - 500→200으로 단축하여 실시간성 향상
+VAD_THRESHOLD = 0.3           # VAD 임계값 (0~1) - 낮을수록 민감하게 감지
 NOISE_FLOOR_DECAY  = 0.995     # 노이즈 플로어 감소율 (환경 변화 적응용, 0~1)
 
 # ─────────────────────────────────────────────
@@ -295,7 +296,7 @@ def audio_collector():
     # 노이즈 플로어 측정용
     calibration_rms_list = []
     calibration_done = False
-    calibration_chunks = 3  # 처음 3개 청크(약 6초)로 주변 소음 측정
+    calibration_chunks = 3  # 처음 3개 청크(약 3초)로 주변 소음 측정
 
     while is_running:
         try:
@@ -307,7 +308,7 @@ def audio_collector():
             if total_samples >= samples_per_chunk:
                 # 버퍼 합치기
                 audio_data = np.concatenate(buffer, axis=0).flatten().astype(np.float32)
-                buffer = []
+                buffer = []  # 버퍼 비우기 (단어마다 바로 처리)
 
                 # 오디오 증폭 (AUDIO_GAIN 적용)
                 if AUDIO_GAIN != 1.0:
@@ -329,23 +330,17 @@ def audio_collector():
                     continue
 
                 # 적응형 노이즈 플로어 업데이트 (환경 변화 대응)
-                # - 낮은 RMS일 때만 (무음/잡음) 노이즈 플로어 업데이트
-                # -话音 중에는 업데이트하지 않음
                 if rms < noise_floor * SILENCE_MULTIPLIER * 0.8:
-                    # 환경이 더 조용해졌다고 판단, 점진적 감소
                     noise_floor = noise_floor * NOISE_FLOOR_DECAY + rms * (1 - NOISE_FLOOR_DECAY)
                     noise_floor = max(noise_floor, MIN_RMS_THRESHOLD)
                 elif rms > noise_floor * 10:
-                    # 갑자기 큰 소리가 발생하면 노이즈 플로어를 급격히 올리지 않음 (순간 소음 무시)
-                    pass
+                    pass  # 순간 소음 무시
 
                 # 적응형 무음 감지
                 threshold = max(noise_floor * SILENCE_MULTIPLIER, MIN_RMS_THRESHOLD)
                 if rms < threshold:
                     logging.debug(f"[소리입력] 무음 (RMS: {rms:.6f} < 임계값: {threshold:.6f})")
                     continue
-                else:
-                    logging.info(f"[소리입력] 음성 감지! (RMS: {rms:.6f} > 임계값: {threshold:.6f})")
 
                 chunk_count += 1
 
@@ -354,7 +349,6 @@ def audio_collector():
                     stt_queue.put_nowait(audio_data)
                     logging.info(f"[Audio] 청크 #{chunk_count} → STT 큐 전달 (대기: {stt_queue.qsize()})")
                 except queue.Full:
-                    # 큐가 가득 차면 가장 오래된 것을 버리고 새 것을 넣음
                     try:
                         stt_queue.get_nowait()
                     except queue.Empty:
@@ -392,7 +386,7 @@ def stt_worker(whisper: WhisperModel, worker_id: int):
                     "vad_filter": True,
                     "vad_parameters": {
                         "min_silence_duration_ms": VAD_MIN_SILENCE_MS,
-                        "threshold": 0.5,  # VAD 임계값 (0~1, 높을수록 엄격)
+                        "threshold": VAD_THRESHOLD,  # VAD 임계값 (0~1, 낮을수록 민감)
                     },
                 }
                 if lang_param:
