@@ -83,7 +83,7 @@ console = Console()
 # 파이프라인 큐
 audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()        # 오디오 원본 청크
 stt_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=10)  # STT 대기 오디오
-translate_queue: "queue.Queue[str]" = queue.Queue(maxsize=20)   # 번역 대기 텍스트
+translate_queue: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=20)   # 번역 대기 텍스트
 
 # 스레드 안전 히스토리 잠금
 history_lock = threading.Lock()
@@ -662,6 +662,7 @@ def translate_worker(_worker_id: int):
                         kr_text += chunk
                         current_kr = kr_text
                 else:
+                    assert ollama_client is not None
                     for chunk in ollama_client.chat(
                         model=current_ollama_model,
                         messages=[{"role": "user", "content": prompt}],
