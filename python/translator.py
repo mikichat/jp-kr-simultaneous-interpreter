@@ -474,7 +474,7 @@ def handle_model_change():
     try:
         ollama = OllamaClient(host=OLLAMA_HOST)
         models = ollama.list()
-        model_names = [m.model for m in models.models]
+        model_names = [m.model for m in models.models if m.model is not None]
 
         console.print("[cyan]사용 가능한 모델:[/cyan]")
         for i, m in enumerate(model_names, 1):
@@ -875,7 +875,7 @@ def main():
         try:
             ollama = OllamaClient(host=OLLAMA_HOST)
             models = ollama.list()
-            model_names = [m.model for m in models.models]
+            model_names = [m.model for m in models.models if m.model is not None]
             console.print(f"[green]✓ 사용 가능한 모델: {', '.join(model_names)}[/green]")
 
             # 전체 모델 목록에서 선택
