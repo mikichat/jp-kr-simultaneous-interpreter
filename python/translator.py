@@ -59,6 +59,11 @@ WHISPER_MODEL = "small"       # tiny / base / small / medium
 OLLAMA_MODEL  = "aya-expanse:8b"  # aya-expanse:8b / gemma4:e4b
 OLLAMA_HOST   = "http://localhost:11434"
 
+# Llama.cpp Server 설정
+USE_LLAMACPP = False          # True로 설정하면 Llama.cpp Server 사용
+LLAMACPP_HOST = "http://localhost:8080"
+LLAMACPP_MODEL = ""           # Llama.cpp 서버에서 로드된 모델 (서버 시작 시 지정)
+
 # Minimax API 설정
 USE_MINIMAX = False           # True로 설정하면 Minimax API 사용
 MINIMAX_API_KEY = ""          # Minimax API 키 (환경변수 MINIMAX_API_KEY也可)
@@ -636,6 +641,44 @@ def translate_with_minimax(prompt: str) -> str:
     return kr_text
 
 
+def translate_with_llamacpp(prompt: str) -> str:
+    """Llama.cpp Server를 사용하여 번역 수행 (스트리밍, OpenAI 호환)"""
+    headers = {
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": LLAMACPP_MODEL,
+        "messages": [{"role": "user", "content": prompt}],
+        "stream": True,
+        "temperature": 0.3,
+    }
+
+    kr_text = ""
+    current_kr = ""
+    with httpx.stream("POST", f"{LLAMACPP_HOST}/v1/chat/completions", headers=headers, json=payload, timeout=120.0) as resp:
+        for line in resp.iter_lines():
+            if not line:
+                continue
+            line = line.strip()
+            if line == "data: [DONE]":
+                break
+            if line.startswith("data: "):
+                line = line[6:].strip()
+            if not line or line == "[DONE]":
+                break
+            import json
+            try:
+                data = json.loads(line)
+                if data.get("choices"):
+                    delta = data["choices"][0].get("delta", {}).get("content", "")
+                    if delta:
+                        kr_text += delta
+                        current_kr = kr_text
+            except json.JSONDecodeError:
+                continue
+    return kr_text
+
+
 def translate_worker(_worker_id: int):
     global current_kr, status_msg, translate_pending, error_msg, ollama_client, current_ollama_model
 
@@ -660,6 +703,10 @@ def translate_worker(_worker_id: int):
 
                 if USE_MINIMAX:
                     for chunk in translate_with_minimax(prompt):
+                        kr_text += chunk
+                        current_kr = kr_text
+                elif USE_LLAMACPP:
+                    for chunk in translate_with_llamacpp(prompt):
                         kr_text += chunk
                         current_kr = kr_text
                 else:
@@ -726,7 +773,7 @@ def build_ui() -> Layout:
     # 헤더 - 소스 언어 표시
     lang_display = {"ja": "JP", "en": "EN", "zh": "CN", "auto": "AUTO"}.get(SOURCE_LANG, "?")
     lang_flag = {"ja": "🎌", "en": "🇺🇸", "zh": "🇨🇳", "auto": "🌐"}.get(SOURCE_LANG, "🌐")
-    backend_name = "Minimax API" if USE_MINIMAX else "Ollama (Local)"
+    backend_name = "Minimax API" if USE_MINIMAX else ("Llama.cpp" if USE_LLAMACPP else "Ollama (Local)")
     header_text = Text()
     header_text.append(f"{lang_flag} ", style="bold red")
     header_text.append(f"{lang_display} → KR ", style="bold white")
@@ -835,27 +882,28 @@ def select_language() -> str:
     return lang_map[choice]
 
 
-def select_translation_backend() -> bool:
-    """번역 백엔드를 선택합니다. True=Minimax, False=Ollama"""
+def select_translation_backend() -> str:
+    """번역 백엔드를 선택합니다. Returns: 'ollama', 'minimax', or 'llamacpp'"""
     console.print("\n[cyan]번역 백엔드를 선택하세요:[/cyan]")
     console.print("  [bold]1[/bold]  🦙  Ollama (로컬 LLM, 무료, GPU 권장)")
     console.print("  [bold]2[/bold]  🤖  Minimax API (클라우드, API 키 필요)")
+    console.print("  [bold]3[/bold]  🦙  Llama.cpp Server (로컬, 포트 8080)")
     console.print()
     choice = Prompt.ask(
         "[cyan]번호를 입력하세요[/cyan]",
         default="1",
-        choices=["1", "2"],
+        choices=["1", "2", "3"],
     )
-    return choice == "2"
+    return {"1": "ollama", "2": "minimax", "3": "llamacpp"}[choice]
 
 
 def main():
-    global is_running, SOURCE_LANG, USE_MINIMAX
+    global is_running, SOURCE_LANG, USE_MINIMAX, USE_LLAMACPP
 
     console.print(
         Panel(
             "[bold cyan]JP / EN / CN → KR 동시통역기[/bold cyan]\n"
-            "[dim]로컬 Whisper + Ollama/Minimax 기반 실시간 번역[/dim]",
+            "[dim]로컬 Whisper + Ollama/Minimax/Llama.cpp 기반 실시간 번역[/dim]",
             border_style="cyan",
             padding=(1, 4),
         )
@@ -863,16 +911,41 @@ def main():
 
     # 1. 번역 백엔드 선택
     console.print("\n[cyan]1/5  번역 백엔드 선택[/cyan]")
-    USE_MINIMAX = select_translation_backend()
+    backend = select_translation_backend()
+    USE_MINIMAX = (backend == "minimax")
+    USE_LLAMACPP = (backend == "llamacpp")
+
     if USE_MINIMAX:
         console.print("[yellow]⚠️  Minimax API 사용 모드[/yellow]")
         console.print("[dim]  MINIMAX_API_KEY 환경변수를 설정하세요.[/dim]")
+    elif USE_LLAMACPP:
+        console.print("[green]✓ Llama.cpp Server 사용 모드[/green]")
+        console.print("[dim]  localhost:8080 에서 실행 중인지 확인하세요.[/dim]")
     else:
         console.print("[green]✓ Ollama 로컬 LLM 사용 모드[/green]")
 
-    # 2. Ollama 연결 확인 (Ollama 모드일 때만)
+    # 2. Ollama/Llama.cpp 연결 확인 (로컬 LLM 모드일 때만)
     ollama = None
-    if not USE_MINIMAX:
+    if USE_LLAMACPP:
+        console.print("\n[cyan]2/5  Llama.cpp Server 연결 확인 중...[/cyan]")
+        try:
+            with httpx.Client() as client:
+                resp = client.get(f"{LLAMACPP_HOST}/v1/models", timeout=5.0)
+                if resp.status_code == 200:
+                    models_data = resp.json()
+                    model_names = [m.get("id", "") for m in models_data.get("data", []) if m.get("id")]
+                    console.print(f"[green]✓ 사용 가능한 모델: {', '.join(model_names) or '알 수 없음'}[/green]")
+                    if model_names:
+                        LLAMACPP_MODEL = model_names[0]
+                        console.print(f"[green]✓ 첫 번째 모델 사용: {LLAMACPP_MODEL}[/green]")
+                else:
+                    console.print(f"[yellow]⚠️  모델 목록 조회 실패 (상태코드: {resp.status_code})[/yellow]")
+                    console.print("[dim]  GGUF 모델이 서버에 로드되어 있는지 확인하세요.[/dim]")
+        except Exception as e:
+            console.print(f"[red]✗ Llama.cpp Server 연결 실패: {e}[/red]")
+            console.print(f"[dim]  서버가 {LLAMACPP_HOST} 에서 실행 중인지 확인하세요.[/dim]")
+            sys.exit(1)
+    elif not USE_MINIMAX:
         console.print("\n[cyan]2/5  Ollama 연결 확인 중...[/cyan]")
         try:
             ollama = OllamaClient(host=OLLAMA_HOST)
@@ -935,7 +1008,7 @@ def main():
     console.print(f"[green]✓ 소스 언어: {lang_display}[/green]")
 
     # 5. 오디오 장치 선택
-    step = "4/5" if USE_MINIMAX else "5/5"
+    step = "4/5" if (USE_MINIMAX or USE_LLAMACPP) else "5/5"
     console.print(f"\n[cyan]{step}  오디오 장치 선택[/cyan]")
     device_idx = select_device()
     dev_info = sd.query_devices(device_idx)

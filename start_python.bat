@@ -36,11 +36,13 @@ echo.
 echo  Select translation backend:
 echo   1 - Ollama (local LLM)
 echo   2 - Minimax API
+echo   3 - Llama.cpp Server
 echo.
 
-set /p MODE="Enter 1 or 2: "
+set /p MODE="Enter 1, 2, or 3: "
 
 if "%MODE%"=="2" goto minimax
+if "%MODE%"=="3" goto llamacpp
 
 :ollama
 echo [INFO] Starting with Ollama mode...
@@ -55,6 +57,14 @@ goto start_translator
 :minimax
 echo [INFO] Starting with Minimax API mode...
 echo [INFO] Make sure MINIMAX_API_KEY environment variable is set.
+goto start_translator
+
+:llamacpp
+echo [INFO] Starting with Llama.cpp Server mode...
+echo [INFO] Starting llama-server...
+start "" "C:\llama-cpp\llama-server" -m "C:\llama-cpp\Hy-MT2-1.8B-Q4_K_M.gguf" -c 2048 --port 8080
+timeout /t 2 /nobreak > nul
+goto start_translator
 
 :start_translator
 echo [INFO] Starting translator...
