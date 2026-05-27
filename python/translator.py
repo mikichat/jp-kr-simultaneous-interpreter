@@ -777,6 +777,7 @@ def translate_worker(_worker_id: int):
 # 터미널 UI 렌더링
 # ─────────────────────────────────────────────
 def build_ui() -> Layout:
+    global status_msg
     layout = Layout()
     layout.split_column(
         Layout(name="header", size=4),
