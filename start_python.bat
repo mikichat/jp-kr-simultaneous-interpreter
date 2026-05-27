@@ -39,9 +39,11 @@ echo   2 - Minimax API
 echo   3 - Llama.cpp Server
 echo.
 
-set /p MODE="Enter 1, 2, or 3: "
+set /p MODE="Enter 1, 2, or 3 (default: 3): "
 
+if "%MODE%"=="1" goto ollama
 if "%MODE%"=="2" goto minimax
+if "%MODE%"=="" goto llamacpp
 if "%MODE%"=="3" goto llamacpp
 
 :ollama

@@ -60,7 +60,7 @@ OLLAMA_MODEL  = "aya-expanse:8b"  # aya-expanse:8b / gemma4:e4b
 OLLAMA_HOST   = "http://localhost:11434"
 
 # Llama.cpp Server 설정
-USE_LLAMACPP = False          # True로 설정하면 Llama.cpp Server 사용
+USE_LLAMACPP = True           # True로 설정하면 Llama.cpp Server 사용
 LLAMACPP_HOST = "http://localhost:8080"
 LLAMACPP_MODEL = ""           # Llama.cpp 서버에서 로드된 모델 (서버 시작 시 지정)
 
@@ -887,11 +887,11 @@ def select_translation_backend() -> str:
     console.print("\n[cyan]번역 백엔드를 선택하세요:[/cyan]")
     console.print("  [bold]1[/bold]  🦙  Ollama (로컬 LLM, 무료, GPU 권장)")
     console.print("  [bold]2[/bold]  🤖  Minimax API (클라우드, API 키 필요)")
-    console.print("  [bold]3[/bold]  🦙  Llama.cpp Server (로컬, 포트 8080)")
+    console.print("  [bold]3[/bold]  🦙  Llama.cpp Server (로컬, 포트 8080) [기본]")
     console.print()
     choice = Prompt.ask(
         "[cyan]번호를 입력하세요[/cyan]",
-        default="1",
+        default="3",
         choices=["1", "2", "3"],
     )
     return {"1": "ollama", "2": "minimax", "3": "llamacpp"}[choice]
