@@ -98,6 +98,7 @@ history: list[dict] = []
 current_src = ""   # 현재 인식된 원문 (일본어 또는 영어)
 current_kr = ""
 is_running = False
+is_paused = False
 status_msg = "대기 중"
 chunk_count = 0
 stt_pending = 0       # STT 대기 중인 오디오 수
@@ -251,6 +252,10 @@ def audio_collector():
     while is_running:
         try:
             chunk = audio_queue.get(timeout=0.3)
+
+            # 일시 중지 시 오디오 무시
+            if is_paused:
+                continue
             buffer.append(chunk)
 
             # 충분한 오디오가 쌓이면 처리
@@ -410,6 +415,16 @@ def command_handler():
             if key in ('q', 'Q'):
                 is_running = False
                 break
+            elif key == readchar.key.ESC:
+                # ESC 키: 일시 중지/재개 토글
+                global is_paused
+                is_paused = not is_paused
+                if is_paused:
+                    console.print("\n[yellow]⏸  일시 중지됨 (ESC 다시 누르면 재개)[/yellow]")
+                    logging.info("[사용자] 일시 중지")
+                else:
+                    console.print("\n[green]▶  재개[/green]")
+                    logging.info("[사용자] 재개")
             elif key in ('d', 'D'):
                 # 장치 변경 요청
                 command_queue.put("change_device")
@@ -839,6 +854,9 @@ def build_ui() -> Layout:
 
     # 푸터 / 상태바
     status_style = "green" if "완료" in status_msg else ("yellow" if "중" in status_msg else "dim")
+    if is_paused:
+        status_style = "bold yellow"
+        status_msg = "⏸  일시 중지됨 (ESC: 재개)"
     threshold = max(noise_floor * SILENCE_MULTIPLIER, MIN_RMS_THRESHOLD)
     rms_style = "green" if current_rms > threshold else "dim"
     status_line = Text()
@@ -853,7 +871,7 @@ def build_ui() -> Layout:
     status_line.append(f"  |  장치: [yellow]{current_device_idx}[/yellow]", style="dim")
     if error_msg:
         status_line.append(f"  ⚠️  {error_msg}", style="bold red")
-    status_line.append("  |  [D]장치  [M]모델  |  종료: [bold]Ctrl+C[/bold]", style="dim")
+    status_line.append("  |  [ESC]일시중지  [D]장치  [M]모델  |  종료: [bold]Ctrl+C[/bold]", style="dim")
 
     layout["footer"].update(
         Panel(status_line, border_style="dim", padding=(0, 1))
