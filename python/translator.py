@@ -76,7 +76,7 @@ TRANSLATE_WORKERS = 1         # 번역 워커 수 (Ollama/Minimax 응답 대기 
 SOURCE_LANG   = "ja"          # 소스 언어 (ja/en/zh/auto)
 AUDIO_GAIN         = 4.0      # 오디오 증폭 배수 (1.0=원본, 2.0=2배 증폭, 3.0=3배, 4.0=4배, 5.0=5배)
 SILENCE_MULTIPLIER = 1.05     # 노이즈 플로어 대비 이 배수 이상이면 음성으로 판단 (낮을수록 민감, 1.0=노이즈와 동일)
-MIN_RMS_THRESHOLD  = 0.00003  # RMS 최소 임계값 (이 아래는 무조건 무음) - 더 작게하여 작은 소리도 감지
+MIN_RMS_THRESHOLD  = 0.0001    # RMS 최소 임계값 (이 아래는 무조건 무음) - 자막음 등 작은 소리 필터링
 VAD_MIN_SILENCE_MS = 200       # VAD 최소 무음 시간 (ms) - 500→200으로 단축하여 실시간성 향상
 VAD_THRESHOLD = 0.3           # VAD 임계값 (0~1) - 낮을수록 민감하게 감지
 NOISE_FLOOR_DECAY  = 0.995     # 노이즈 플로어 감소율 (환경 변화 적응용, 0~1)
@@ -247,7 +247,8 @@ def audio_collector():
     # 노이즈 플로어 측정용
     calibration_rms_list = []
     calibration_done = False
-    calibration_chunks = 3  # 처음 3개 청크(약 3초)로 주변 소음 측정
+    calibration_chunks = 5  # 처음 5개 청크(약 5초)로 주변 소음 측정 - 더 안정적인 기준선 확보
+    calibration_rejected = 0  # 캘리브레이션 중 급격한 변화 건너뜀 횟수
 
     while is_running:
         try:
@@ -274,8 +275,22 @@ def audio_collector():
                 rms = float(np.sqrt(np.mean(audio_data ** 2)))
                 current_rms = rms
 
-                # 캘리브레이션: 처음 몇 청크로 노이즈 플로어 측정
+                # 캘리브레이션: 처음 몇 청크로 노이즈 플로어 측정 (안정적인 기준선 확보)
                 if not calibration_done:
+                    # 급격한 RMS 변화 감지 (자막음처럼 평소와 다른 소리는 건너뜀)
+                    if len(calibration_rms_list) > 0:
+                        prev_rms = calibration_rms_list[-1]
+                        # 이전 값과 2배 이상 차이나면 자막음 등으로 판단하여 무시
+                        if rms > prev_rms * 2.0 or rms < prev_rms * 0.5:
+                            calibration_rejected += 1
+                            logging.info(f"[캘리브레이션] 이상치 건너뜀 ({calibration_rejected}/5): RMS={rms:.6f}")
+                            if calibration_rejected >= 5:
+                                # 너무 많이 건너뛰면 현재 값을 기준선으로 설정
+                                noise_floor = rms
+                                calibration_done = True
+                                logging.info(f"[캘리브레이션 완료] 이상치 과다 → 현재 RMS: {noise_floor:.6f}")
+                            continue
+
                     calibration_rms_list.append(rms)
                     logging.info(f"[캘리브레이션] RMS 측정 중... ({len(calibration_rms_list)}/{calibration_chunks}) RMS={rms:.6f}")
                     if len(calibration_rms_list) >= calibration_chunks:
