@@ -692,7 +692,7 @@ def build_ui() -> Layout:
     # 헤더 - 소스 언어 표시
     lang_display = {"ja": "JP", "en": "EN", "zh": "CN", "auto": "AUTO"}.get(SOURCE_LANG, "?")
     lang_flag = {"ja": "🎌", "en": "🇺🇸", "zh": "🇨🇳", "auto": "🌐"}.get(SOURCE_LANG, "🌐")
-    backend_name = "Minimax API" if USE_MINIMAX else ("Llama.cpp" if USE_LLAMACPP else "Ollama (Local)")
+    backend_name = "Llama.cpp"
     header_text = Text()
     header_text.append(f"{lang_flag} ", style="bold red")
     header_text.append(f"{lang_display} → KR ", style="bold white")
@@ -770,8 +770,6 @@ def build_ui() -> Layout:
     status_line.append(f"  |  청크: {chunk_count}", style="dim")
     status_line.append(f"  |  STT: {stt_pending}", style="cyan")
     status_line.append(f"  |  번역: {translate_pending}", style="magenta")
-    if not USE_MINIMAX:
-        status_line.append(f"  |  모델: [yellow]{current_ollama_model}[/yellow]", style="dim")
     status_line.append(f"  |  장치: [yellow]{current_device_idx}[/yellow]", style="dim")
     if error_msg:
         status_line.append(f"  ⚠️  {error_msg}", style="bold red")
