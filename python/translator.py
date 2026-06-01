@@ -621,8 +621,8 @@ def stt_worker(whisper: WhisperModel, worker_id: int):
 
 # ─────────────────────────────────────────────
 # [파이프라인 3단계] 번역 워커
-# - translate_queue에서 소스 텍스트를 꺼내 Ollama로 번역
-# - 여러 워커가 병렬로 번역 처리 가능
+# - translate_queue에서 소스 텍스트를 꺼내 Llama.cpp로 번역
+# - 세마포어로 동시 번역 수 제한 (GPU VRAM 보호)
 # ─────────────────────────────────────────────
 def _build_prompt(src_text: str, src_lang: str) -> str:
     """간단한 실시간 번역 프롬프트를 생성합니다."""
@@ -844,7 +844,7 @@ def build_ui() -> Layout:
     status_line.append(f"  |  장치: [yellow]{current_device_idx}[/yellow]", style="dim")
     if error_msg:
         status_line.append(f"  ⚠️  {error_msg}", style="bold red")
-    status_line.append("  |  [ESC]일시중지  [D]장치  [M]모델  |  종료: [bold]Ctrl+C[/bold]", style="dim")
+    status_line.append("  |  [ESC]일시중지  [D]장치  [G]GPU  |  종료: [bold]Ctrl+C[/bold]", style="dim")
 
     layout["footer"].update(
         Panel(status_line, border_style="dim", padding=(0, 1))
