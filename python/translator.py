@@ -400,36 +400,74 @@ def change_audio_device(new_device_idx: int) -> bool:
 
 
 # ─────────────────────────────────────────────
-# [런타임 변경] Ollama 모델 변경
+# [런타임 변경] GPU 모드 확인/조절
 # ─────────────────────────────────────────────
-def change_ollama_model(new_model: str) -> bool:
-    """Ollama 모델을 변경합니다."""
-    global current_ollama_model, ollama_client
+def get_gpu_mode_display() -> str:
+    """현재 GPU 모드를 문자열로 반환"""
+    if LLM_GPU_LAYERS == 0:
+        return "CPU only"
+    else:
+        return f"GPU ({LLM_GPU_LAYERS} layers)"
 
-    try:
-        # 새 모델로 연결 테스트
-        test_client = OllamaClient(host=OLLAMA_HOST)
-        test_client.chat(
-            model=new_model,
-            messages=[{"role": "user", "content": "test"}],
-            stream=False,
-        )
-        current_ollama_model = new_model
-        ollama_client = test_client
-        console.print(f"[green]✓ Ollama 모델 변경 완료: {new_model}[/green]")
-        logging.info(f"[모델 변경 완료] {new_model}")
-        return True
-    except Exception as e:
-        logging.error(f"[모델 변경 실패] {e}")
-        console.print(f"[red]✗ 모델 변경 실패: {e}[/red]")
-        return False
+
+def change_llamacpp_settings():
+    """Llama.cpp 설정 변경 (G键)"""
+    global LLM_GPU_LAYERS, LLM_TEMPERATURE, LLM_NUM_CTX
+
+    console.print("\n[cyan]═══ Llama.cpp 설정 변경 ═══[/cyan]")
+    gpu_mode = get_gpu_mode_display()
+
+    table = Table(title="현재 설정", box=box.ROUNDED, border_style="cyan")
+    table.add_column("항목", style="bold cyan", width=20)
+    table.add_column("값", style="white")
+    table.add_row("GPU 모드", f"{gpu_mode} (G键으로 토글)")
+    table.add_row("Temperature", str(LLM_TEMPERATURE))
+    table.add_row("Context Window", str(LLM_NUM_CTX))
+    table.add_row("동시 번역 제한", str(LLM_MAX_CONCURRENT))
+    console.print(table)
+
+    console.print("\n[dim]G键: GPU 레이어 토글 (0 → 8 → 16 → 0 순환)[/dim]")
+    choice = Prompt.ask(
+        "[cyan]변경할 설정 번호를 입력하세요 (취소: Enter)[/cyan]",
+        default="",
+        choices=["1", "2", "3"],
+    )
+
+    if choice == "1":
+        # GPU 레이어 조절 (0 → 8 → 16 → 0 순환)
+        new_layers = (LLM_GPU_LAYERS + 8) % 24
+        console.print(f"[yellow]GPU 레이어 변경: {LLM_GPU_LAYERS} → {new_layers}[/yellow]")
+        console.print(f"[dim]※ Llama.cpp Server 재시작 필요 (Ctrl+C 후 server 재실행)[/dim]")
+        logging.info(f"[설정 변경] GPU layers: {LLM_GPU_LAYERS} → {new_layers} (재시작 필요)")
+    elif choice == "2":
+        new_temp = Prompt.ask("[cyan]Temperature 값 (0.1~0.3)[/cyan]", default=str(LLM_TEMPERATURE))
+        try:
+            new_temp_f = float(new_temp)
+            if 0.0 < new_temp_f <= 1.0:
+                LLM_TEMPERATURE = new_temp_f
+                console.print(f"[green]✓ Temperature: {LLM_TEMPERATURE}[/green]")
+                logging.info(f"[설정 변경] Temperature: {new_temp_f}")
+        except ValueError:
+            console.print("[red]✗ 잘못된 값입니다.[/red]")
+    elif choice == "3":
+        new_ctx = Prompt.ask("[cyan]Context Window 크기 (512~8192)[/cyan]", default=str(LLM_NUM_CTX))
+        try:
+            new_ctx_i = int(new_ctx)
+            if 512 <= new_ctx_i <= 8192:
+                LLM_NUM_CTX = new_ctx_i
+                console.print(f"[green]✓ Context: {LLM_NUM_CTX}[/green]")
+                logging.info(f"[설정 변경] num_ctx: {new_ctx_i}")
+        except ValueError:
+            console.print("[red]✗ 잘못된 값입니다.[/red]")
+
+    console.print("[cyan]═════════════════════════[/cyan]\n")
 
 
 # ─────────────────────────────────────────────
 # [런타임 변경] 명령 핸들러 스레드
 # ─────────────────────────────────────────────
 def command_handler():
-    """메인 루프와 별개로 사용자 명령을 처리합니다. D=장치변경"""
+    """메인 루프와 별개로 사용자 명령을 처리합니다. D=장치변경, G=GPU설정"""
     global is_running
 
     import readchar
@@ -454,6 +492,9 @@ def command_handler():
             elif key in ('d', 'D'):
                 # 장치 변경 요청
                 command_queue.put("change_device")
+            elif key in ('g', 'G'):
+                # GPU 설정 변경 요청
+                command_queue.put("change_gpu")
         except Exception:
             pass
 
@@ -462,6 +503,8 @@ def command_handler():
             cmd = command_queue.get(timeout=0.1)
             if cmd == "change_device":
                 handle_device_change()
+            elif cmd == "change_gpu":
+                change_llamacpp_settings()
         except queue.Empty:
             pass
 
