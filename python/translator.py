@@ -3,8 +3,8 @@
 """
 JP/EN→KR 동시통역 - 비동기 파이프라인
 - 오디오 캡처: sounddevice
-- 음성인식: faster-whisper (로컬)
-- 번역: Ollama 로컬 LLM 또는 Minimax API
+- 음성인식: faster-whisper (로컬, CPU 전용)
+- 번역: Llama.cpp Server (GPU 자원 효율化管理)
 - UI: rich 터미널
 
 [파이프라인 구조]
@@ -12,7 +12,7 @@ JP/EN→KR 동시통역 - 비동기 파이프라인
                                        ↓
                                   [STT Worker] → translate_queue
                                                       ↓
-                                                [Translate Worker] → 화면 출력
+                                          [Translate Worker × semaphore] → 화면 출력
 """
 
 import threading
@@ -20,10 +20,10 @@ import queue
 import time
 import sys
 import signal
+import os
 from datetime import datetime
 from typing import Any
 import logging
-import os
 
 # ────────── 로깅 설정 ──────────
 logging.basicConfig(
@@ -50,30 +50,35 @@ from rich.columns import Columns
 from rich.prompt import Prompt
 
 # ─────────────────────────────────────────────
-# 설정
+# GPU 효율화 설정 (환경변수优先)
 # ─────────────────────────────────────────────
+LLM_GPU_LAYERS = int(os.getenv("LLM_GPU_LAYERS", "0"))  # 0=CPU only, 양수=GPU 레이어 수
+LLM_TEMPERATURE = float(os.getenv("LLM_TEMPERATURE", "0.3"))  # 0.1~0.3 권장
+LLM_NUM_CTX = int(os.getenv("LLM_NUM_CTX", "2048"))  # 번역에는 2048이면 충분
+LLM_MAX_CONCURRENT = int(os.getenv("LLM_MAX_CONCURRENT", "1"))  # GPU VRAM 보호용 세마포어
+MAX_AUDIO_BUFFER_SEC = 30  # 오디오 버퍼 최대 크기 (메모리 보호)
+
+# ─────────────────────────────────────────────
+# Llama.cpp Server 설정 (GPU 효율화)
+# ─────────────────────────────────────────────
+LLAMACPP_HOST = os.getenv("LLAMACPP_HOST", "http://localhost:8080")
+LLAMACPP_MODEL = os.getenv("LLAMACPP_MODEL", "")  # 서버 시작 시 지정된 모델
+
 SAMPLE_RATE  = 16000          # Whisper 권장 샘플레이트
-CHUNK_SEC    = 1              # 오디오 청크 단위 (초) - 실시간성을 위해 3→1로 단축
+CHUNK_SEC    = 1              # 오디오 청크 단위 (초)
 CHANNELS     = 1              # 모노
 WHISPER_MODEL = "small"       # tiny / base / small / medium
-OLLAMA_MODEL  = "aya-expanse:8b"  # aya-expanse:8b / gemma4:e4b
-OLLAMA_HOST   = "http://localhost:11434"
-
-# Llama.cpp Server 설정
-USE_LLAMACPP = True           # True로 설정하면 Llama.cpp Server 사용
-LLAMACPP_HOST = "http://localhost:8080"
-LLAMACPP_MODEL = ""           # Llama.cpp 서버에서 로드된 모델 (서버 시작 시 지정)
 
 MAX_HISTORY   = 15            # 표시할 최대 히스토리 수
 STT_WORKERS   = 1             # STT 워커 수 (CPU 기반이라 1개 권장)
-TRANSLATE_WORKERS = 1         # 번역 워커 수 (Ollama/Minimax 응답 대기 동안 병렬 처리)
+TRANSLATE_WORKERS = 1         # 번역 워커 수 (세마포어로 동시 제어)
 SOURCE_LANG   = "ja"          # 소스 언어 (ja/en/zh/auto)
-AUDIO_GAIN         = 3.0      # 오디오 증폭 배수 (1.0=원본, 2.0=2배 증폭, 3.0=3배, 4.0=4배, 5.0=5배)
-SILENCE_MULTIPLIER = 1.05     # 노이즈 플로어 대비 이 배수 이상이면 음성으로 판단 (낮을수록 민감, 1.0=노이즈와 동일)
-MIN_RMS_THRESHOLD  = 0.0100    # RMS 최소 임계값 (이 아래는 무조건 무음) - 자막음 등 작은 소리 필터링
-VAD_MIN_SILENCE_MS = 500       # VAD 최소 무음 시간 (ms) - 200→500으로 증가하여 문장 분리 향상
-VAD_THRESHOLD = 0.5           # VAD 임계값 (0~1) - 낮을수록 민감하게 감지
-NOISE_FLOOR_DECAY  = 0.995     # 노이즈 플로어 감소율 (환경 변화 적응용, 0~1)
+AUDIO_GAIN         = 3.0      # 오디오 증폭 배수
+SILENCE_MULTIPLIER = 1.05     # 노이즈 플로어 대비 이 배수 이상이면 음성으로 판단
+MIN_RMS_THRESHOLD  = 0.0100    # RMS 최소 임계값 (자막음 등 작은 소리 필터링)
+VAD_MIN_SILENCE_MS = 500       # VAD 최소 무음 시간 (ms)
+VAD_THRESHOLD = 0.5           # VAD 임계값 (0~1)
+NOISE_FLOOR_DECAY  = 0.995     # 노이즈 플로어 감소율
 
 # ─────────────────────────────────────────────
 # 전역 상태
@@ -108,6 +113,12 @@ stream_lock = threading.Lock()  # 스트림 변경용 잠금
 
 # 명령 큐 (런타임 변경 명령)
 command_queue: "queue.Queue[str]" = queue.Queue()
+
+# GPU VRAM 보호용 세마포어 (동시 번역 요청 수 제한)
+translation_semaphore: "threading.Semaphore" = None  # 런타임에서 초기화
+
+# 오디오 버퍼 플래그 (메모리 보호)
+audio_buffer_too_large = False
 
 # ─────────────────────────────────────────────
 # 오디오 장치 목록 표시
@@ -257,6 +268,14 @@ def audio_collector():
                 # 버퍼 합치기
                 audio_data = np.concatenate(buffer, axis=0).flatten().astype(np.float32)
                 buffer = []  # 버퍼 비우기 (단어마다 바로 처리)
+
+                # 오디오 버퍼 크기 명시적 제한 (메모리 보호)
+                buffer_sec = len(audio_data) / SAMPLE_RATE
+                if buffer_sec > MAX_AUDIO_BUFFER_SEC:
+                    audio_buffer_too_large = True
+                    logging.warning(f"[Audio] 버퍼 크기 초과 ({buffer_sec:.1f}초 > {MAX_AUDIO_BUFFER_SEC}초) →_truncate")
+                    audio_data = audio_data[int(-MAX_AUDIO_BUFFER_SEC * SAMPLE_RATE):]  # 최근 것만 유지
+                    audio_buffer_too_large = False
 
                 # 오디오 증폭 (AUDIO_GAIN 적용)
                 if AUDIO_GAIN != 1.0:
@@ -577,7 +596,7 @@ def _build_prompt(src_text: str, src_lang: str) -> str:
 
 
 def translate_with_llamacpp(prompt: str) -> str:
-    """Llama.cpp Server를 사용하여 번역 수행 (스트리밍, OpenAI 호환)"""
+    """Llama.cpp Server를 사용하여 번역 수행 (GPU 효율화: 스트리밍, OpenAI 호환)"""
     headers = {
         "Content-Type": "application/json",
     }
@@ -585,11 +604,14 @@ def translate_with_llamacpp(prompt: str) -> str:
         "model": LLAMACPP_MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "stream": True,
-        "temperature": 0.3,
+        "temperature": LLM_TEMPERATURE,  # 환경변수에서 설정 (0.1~0.3)
+        "num_ctx": LLM_NUM_CTX,  # VRAM 절약용 컨텍스트 윈도우 크기
     }
 
     kr_text = ""
     current_kr = ""
+    gpu_mode = "CPU" if LLM_GPU_LAYERS == 0 else f"GPU({LLM_GPU_LAYERS} layers)"
+    logging.info(f"[Llama.cpp] 요청 중... (mode: {gpu_mode}, temp: {LLM_TEMPERATURE}, ctx: {LLM_NUM_CTX})")
     with httpx.stream("POST", f"{LLAMACPP_HOST}/v1/chat/completions", headers=headers, json=payload, timeout=120.0) as resp:
         for line in resp.iter_lines():
             if not line:
@@ -619,53 +641,59 @@ def translate_worker(_worker_id: int):
 
     while is_running:
         try:
-            item = translate_queue.get(timeout=0.5)
-            src_text = item["text"]
-            src_lang = item.get("lang", SOURCE_LANG)
-            translate_pending = translate_queue.qsize()
-            status_msg = "🔄  번역 중..."
+            # 세마포어로 GPU VRAM 보호 (동시 번역 수 제한)
+            with translation_semaphore:
+                item = translate_queue.get(timeout=0.5)
+                src_text = item["text"]
+                src_lang = item.get("lang", SOURCE_LANG)
+                translate_pending = translate_queue.qsize()
+                status_msg = "🔄  번역 중..."
 
-            try:
-                prompt = _build_prompt(src_text, src_lang)
-                logging.info(f"[번역-{_worker_id}] 요청 중... (백엔드: Llama.cpp, 언어: {src_lang})")
-                logging.debug(f"[번역-{_worker_id}] 프롬프트:\n{prompt}")
-                start_time = time.time()
+                # 큐 임계값 초과 시 새 요청 거부 (메모리 보호)
+                if translate_pending > 15:
+                    logging.warning(f"[번역-{_worker_id}] 큐 임계값 초과 ({translate_pending}/20) → 스킵")
+                    continue
 
-                # 스트리밍 응답으로 실시간 번역 결과 표시
-                kr_text = ""
-                current_kr = ""  # 초기화
+                try:
+                    prompt = _build_prompt(src_text, src_lang)
+                    logging.info(f"[번역-{_worker_id}] 요청 중... (백엔드: Llama.cpp, 언어: {src_lang})")
+                    logging.debug(f"[번역-{_worker_id}] 프롬프트:\n{prompt}")
+                    start_time = time.time()
 
-                for chunk in translate_with_llamacpp(prompt):
-                    kr_text += chunk
+                    # 스트리밍 응답으로 실시간 번역 결과 표시
+                    kr_text = ""
+                    current_kr = ""  # 초기화
+
+                    for chunk in translate_with_llamacpp(prompt):
+                        kr_text += chunk
+                        current_kr = kr_text
+
+                    elapsed = time.time() - start_time
+                    logging.info(f"[번역-{_worker_id}] 완료 ({elapsed:.1f}초): {kr_text}")
                     current_kr = kr_text
+                    error_msg = ""
 
-                elapsed = time.time() - start_time
-                logging.info(f"[번역-{_worker_id}] 완료 ({elapsed:.1f}초): {kr_text}")
-            except Exception as e:
-                error_msg = f"번역 오류: {e}"
-                logging.error(f"[번역-{_worker_id} 오류] {e}")
-                status_msg = "대기 중"
-                continue
+                    # 히스토리 추가 (스레드 안전)
+                    lang_flag = {"ja": "🇯🇵", "en": "🇺🇸", "zh": "🇨🇳"}.get(src_lang, "🌐")
+                    with history_lock:
+                        history.insert(0, {
+                            "time": datetime.now().strftime("%H:%M:%S"),
+                            "src": src_text,
+                            "kr": kr_text,
+                            "lang": src_lang,
+                            "flag": lang_flag,
+                        })
+                        if len(history) > MAX_HISTORY:
+                            history.pop()
 
-            current_kr = kr_text
-            error_msg = ""
-
-            # 히스토리 추가 (스레드 안전)
-            lang_flag = {"ja": "🇯🇵", "en": "🇺🇸", "zh": "🇨🇳"}.get(src_lang, "🌐")
-            with history_lock:
-                history.insert(0, {
-                    "time": datetime.now().strftime("%H:%M:%S"),
-                    "src": src_text,
-                    "kr": kr_text,
-                    "lang": src_lang,
-                    "flag": lang_flag,
-                })
-                if len(history) > MAX_HISTORY:
-                    history.pop()
-
-            status_msg = "✅  번역 완료"
-            time.sleep(0.3)
-            status_msg = "대기 중"
+                    status_msg = "✅  번역 완료"
+                    time.sleep(0.3)
+                    status_msg = "대기 중"
+                except Exception as e:
+                    error_msg = f"번역 오류: {e}"
+                    logging.error(f"[번역-{_worker_id} 오류] {e}")
+                    status_msg = "대기 중"
+                    continue
 
         except queue.Empty:
             translate_pending = 0
@@ -805,7 +833,7 @@ def select_language() -> str:
 
 
 def main():
-    global is_running, SOURCE_LANG, USE_LLAMACPP
+    global is_running, SOURCE_LANG
 
     console.print(
         Panel(
@@ -859,14 +887,25 @@ def main():
     console.print(f"[green]✓ 선택된 장치: {device_name}[/green]\n")
 
     # 전역 변수 설정 (런타임 변경용)
-    global current_device_idx, current_ollama_model
+    global current_device_idx
     current_device_idx = device_idx
 
-    logging.info(f"--- 프로그램 시작 (비동기 파이프라인) ---")
+    # GPU 효율화: 세마포어 초기화 (동시 번역 수 제한)
+    global translation_semaphore
+    translation_semaphore = threading.Semaphore(LLM_MAX_CONCURRENT)
+
+    gpu_mode = "CPU only" if LLM_GPU_LAYERS == 0 else f"GPU ({LLM_GPU_LAYERS} layers)"
+    logging.info(f"--- 프로그램 시작 (GPU 효율화) ---")
     logging.info(f"번역 백엔드: Llama.cpp Server")
+    logging.info(f"GPU 모드: {gpu_mode}, Temperature: {LLM_TEMPERATURE}, Context: {LLM_NUM_CTX}")
+    logging.info(f"동시 번역 제한: {LLM_MAX_CONCURRENT} (VRAM 보호)")
     logging.info(f"소스 언어: {lang_display}")
     logging.info(f"선택된 오디오 장치: [{device_idx}] {device_name}")
     logging.info(f"STT 워커: {STT_WORKERS}개, 번역 워커: {TRANSLATE_WORKERS}개")
+
+    # GPU 미사용 모드 알림
+    if LLM_GPU_LAYERS == 0:
+        console.print("[dim]ℹ️  GPU 미사용 모드 (LLM_GPU_LAYERS=0, CPU only)[/dim]")
 
     # 시작
     is_running = True
