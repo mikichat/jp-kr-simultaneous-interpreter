@@ -21,22 +21,30 @@ import time
 import sys
 import signal
 import os
+import json
 from datetime import datetime
 from typing import Any
 import logging
+from logging.handlers import RotatingFileHandler
 
 # ────────── 로깅 설정 ──────────
+# 로그가 무한정 커지던 것을 막기 위해 회전(rotation) 적용
 logging.basicConfig(
-    filename='interpreter.log',
     level=logging.INFO,
     format='%(asctime)s [%(levelname)s] %(message)s',
-    encoding='utf-8'
+    handlers=[
+        RotatingFileHandler(
+            'interpreter.log',
+            maxBytes=5 * 1024 * 1024,   # 파일당 최대 5MB
+            backupCount=3,              # 백업 3개까지 보관
+            encoding='utf-8',
+        ),
+    ],
 )
 
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
-from ollama import Client as OllamaClient
 import httpx
 from rich.console import Console
 from rich.panel import Panel
@@ -86,7 +94,9 @@ NOISE_FLOOR_DECAY  = 0.995     # 노이즈 플로어 감소율
 console = Console()
 
 # 파이프라인 큐
-audio_queue: "queue.Queue[np.ndarray]" = queue.Queue()        # 오디오 원본 청크
+# audio_queue는 PortAudio 콜백 스레드가 채우므로 크기를 제한하고,
+# 가득 차면 콜백 스레드에서 가장 오래된 청크를 버린다 (콜백 블로킹 금지)
+audio_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=50)  # 약 5초 분량
 stt_queue: "queue.Queue[np.ndarray]" = queue.Queue(maxsize=10)  # STT 대기 오디오
 translate_queue: "queue.Queue[dict[str, Any]]" = queue.Queue(maxsize=20)   # 번역 대기 텍스트
 
@@ -117,9 +127,6 @@ command_queue: "queue.Queue[str]" = queue.Queue()
 # GPU VRAM 보호용 세마포어 (동시 번역 요청 수 제한)
 translation_semaphore: "threading.Semaphore" = None  # 런타임에서 초기화
 
-# 오디오 버퍼 플래그 (메모리 보호)
-audio_buffer_too_large = False
-
 # ─────────────────────────────────────────────
 # 오디오 장치 목록 표시
 # ─────────────────────────────────────────────
@@ -140,7 +147,6 @@ def list_audio_devices() -> list[dict]:
 def test_device_audio(device_idx: int, duration: float = 3.0) -> float:
     """장치에서 3초간 마이크 입력을监听하여 RMS 레벨 측정."""
     try:
-        import threading
         level_holder = [0.0]
 
         def callback(indata, frames, time_info, status):
@@ -161,6 +167,11 @@ def test_device_audio(device_idx: int, duration: float = 3.0) -> float:
 def select_device() -> int:
     """사용자가 오디오 장치를 선택합니다."""
     devices = list_audio_devices()
+
+    if not devices:
+        console.print("[red]✗ 입력 오디오 장치를 찾을 수 없습니다.[/red]")
+        console.print("[dim]  마이크 연결 또는 '스테레오 믹스' 활성화 여부를 확인해주세요.[/dim]")
+        raise SystemExit(1)
 
     table = Table(title="🎙️  오디오 입력 장치 목록", box=box.ROUNDED, border_style="cyan")
     table.add_column("번호", style="bold cyan", width=6)
@@ -228,10 +239,20 @@ def select_device() -> int:
 # ─────────────────────────────────────────────
 def audio_callback(indata: np.ndarray, frames: int, time_info, status):
     if status:
-        pass  # 오버플로 등 무시
+        return  # 오버플로 등 무시
     with stream_lock:
-        if audio_stream is not None:
-            audio_queue.put(indata.copy())
+        if audio_stream is None:
+            return
+        # PortAudio 콜백 스레드는 실시간 오디오 스레드이므로 절대 블로킹시키지 않는다.
+        # 큐가 가득 차면 가장 오래된 청크를 버리고 현재 청크를 넣는다.
+        try:
+            audio_queue.put_nowait(indata.copy())
+        except queue.Full:
+            try:
+                audio_queue.get_nowait()
+                audio_queue.put_nowait(indata.copy())
+            except (queue.Empty, queue.Full):
+                pass
 
 
 # ─────────────────────────────────────────────
@@ -258,7 +279,9 @@ def audio_collector():
             chunk = audio_queue.get(timeout=0.3)
 
             # 일시 중지 시 오디오 무시
+            # 버퍼도 함께 비워야 재개 시점 이전의 낡은 오디오가 첫 문장에 섞이지 않는다
             if is_paused:
+                buffer.clear()
                 continue
             buffer.append(chunk)
 
@@ -272,10 +295,8 @@ def audio_collector():
                 # 오디오 버퍼 크기 명시적 제한 (메모리 보호)
                 buffer_sec = len(audio_data) / SAMPLE_RATE
                 if buffer_sec > MAX_AUDIO_BUFFER_SEC:
-                    audio_buffer_too_large = True
-                    logging.warning(f"[Audio] 버퍼 크기 초과 ({buffer_sec:.1f}초 > {MAX_AUDIO_BUFFER_SEC}초) →_truncate")
+                    logging.warning(f"[Audio] 버퍼 크기 초과 ({buffer_sec:.1f}초 > {MAX_AUDIO_BUFFER_SEC}초) → truncate")
                     audio_data = audio_data[int(-MAX_AUDIO_BUFFER_SEC * SAMPLE_RATE):]  # 최근 것만 유지
-                    audio_buffer_too_large = False
 
                 # 오디오 증폭 (AUDIO_GAIN 적용)
                 if AUDIO_GAIN != 1.0:
@@ -394,7 +415,7 @@ def change_audio_device(new_device_idx: int) -> bool:
                         blocksize=int(SAMPLE_RATE * 0.1),
                     )
                     audio_stream.start()
-        except:
+        except Exception:
             pass
         return False
 
@@ -435,10 +456,12 @@ def change_llamacpp_settings():
 
     if choice == "1":
         # GPU 레이어 조절 (0 → 8 → 16 → 0 순환)
+        # 이전에는 값만 출력하고 실제 변수에는 반영되지 않아 메뉴가 동작하지 않았다
         new_layers = (LLM_GPU_LAYERS + 8) % 24
-        console.print(f"[yellow]GPU 레이어 변경: {LLM_GPU_LAYERS} → {new_layers}[/yellow]")
+        LLM_GPU_LAYERS = new_layers
+        console.print(f"[yellow]GPU 레이어 변경: {new_layers}[/yellow]")
         console.print(f"[dim]※ Llama.cpp Server 재시작 필요 (Ctrl+C 후 server 재실행)[/dim]")
-        logging.info(f"[설정 변경] GPU layers: {LLM_GPU_LAYERS} → {new_layers} (재시작 필요)")
+        logging.info(f"[설정 변경] GPU layers: → {new_layers} (재시작 필요)")
     elif choice == "2":
         new_temp = Prompt.ask("[cyan]Temperature 값 (0.1~0.3)[/cyan]", default=str(LLM_TEMPERATURE))
         try:
@@ -456,7 +479,8 @@ def change_llamacpp_settings():
             if 512 <= new_ctx_i <= 8192:
                 LLM_NUM_CTX = new_ctx_i
                 console.print(f"[green]✓ Context: {LLM_NUM_CTX}[/green]")
-                logging.info(f"[설정 변경] num_ctx: {new_ctx_i}")
+                console.print(f"[dim]※ num_ctx는 Llama.cpp Server 시작 옵션(-c {new_ctx_i})에 의해 결정됩니다.[/dim]")
+                logging.info(f"[설정 변경] num_ctx: {new_ctx_i} (서버 재시작 필요)")
         except ValueError:
             console.print("[red]✗ 잘못된 값입니다.[/red]")
 
@@ -467,8 +491,13 @@ def change_llamacpp_settings():
 # [런타임 변경] 명령 핸들러 스레드
 # ─────────────────────────────────────────────
 def command_handler():
-    """메인 루프와 별개로 사용자 명령을 처리합니다. D=장치변경, G=GPU설정"""
-    global is_running
+    """키 입력만 감지하고 command_queue에 명령을 넣습니다.
+
+    실제 명령 실행은 메인 스레드(Live UI 소유자)가 수행합니다.
+    이전 구현은 이 스레드에서 Prompt.ask를 직접 호출해 Live UI와 화면 출력이
+    뒤섞이고, 메인 루프와 같은 큐를 동시에 소비하는 경합이 있었습니다.
+    """
+    global is_running, is_paused
 
     import readchar
 
@@ -481,7 +510,6 @@ def command_handler():
                 break
             elif key == readchar.key.ESC:
                 # ESC 키: 일시 중지/재개 토글
-                global is_paused
                 is_paused = not is_paused
                 if is_paused:
                     console.print("\n[yellow]⏸  일시 중지됨 (ESC 다시 누르면 재개)[/yellow]")
@@ -496,16 +524,6 @@ def command_handler():
                 # GPU 설정 변경 요청
                 command_queue.put("change_gpu")
         except Exception:
-            pass
-
-        # command_queue에서 명령 처리
-        try:
-            cmd = command_queue.get(timeout=0.1)
-            if cmd == "change_device":
-                handle_device_change()
-            elif cmd == "change_gpu":
-                change_llamacpp_settings()
-        except queue.Empty:
             pass
 
 
@@ -554,7 +572,7 @@ def handle_device_change():
 # - 결과를 translate_queue에 전달
 # ─────────────────────────────────────────────
 def stt_worker(whisper: WhisperModel, worker_id: int):
-    global current_jp, status_msg, stt_pending, error_msg
+    global current_src, status_msg, stt_pending, error_msg
 
     while is_running:
         try:
@@ -638,8 +656,16 @@ def _build_prompt(src_text: str, src_lang: str) -> str:
 
 
 
-def translate_with_llamacpp(prompt: str) -> str:
-    """Llama.cpp Server를 사용하여 번역 수행 (GPU 효율화: 스트리밍, OpenAI 호환)"""
+def translate_with_llamacpp(prompt: str):
+    """Llama.cpp Server를 사용하여 번역 수행 (스트리밍 제너레이터).
+
+    응답 텍스트 델타를 순차적으로 yield한다.
+    이전에는 완성된 문자열을 반환하면서 호출부가 이를 문자 단위로 순회하고 있어
+    '스트리밍'이 실제로 동작하지 않았다. 이제 델타 단위로 직접 내려보낸다.
+
+    HTTP 오류(서버 미기동, 모델 미로드 등)는 조용히 빈 번역이 되지 않도록
+    예외로 알린다.
+    """
     headers = {
         "Content-Type": "application/json",
     }
@@ -651,11 +677,26 @@ def translate_with_llamacpp(prompt: str) -> str:
         "num_ctx": LLM_NUM_CTX,  # VRAM 절약용 컨텍스트 윈도우 크기
     }
 
-    kr_text = ""
-    current_kr = ""
     gpu_mode = "CPU" if LLM_GPU_LAYERS == 0 else f"GPU({LLM_GPU_LAYERS} layers)"
     logging.info(f"[Llama.cpp] 요청 중... (mode: {gpu_mode}, temp: {LLM_TEMPERATURE}, ctx: {LLM_NUM_CTX})")
-    with httpx.stream("POST", f"{LLAMACPP_HOST}/v1/chat/completions", headers=headers, json=payload, timeout=120.0) as resp:
+
+    with httpx.stream(
+        "POST",
+        f"{LLAMACPP_HOST}/v1/chat/completions",
+        headers=headers,
+        json=payload,
+        timeout=120.0,
+    ) as resp:
+        if resp.status_code != 200:
+            body = ""
+            try:
+                body = resp.read().decode("utf-8", errors="replace")[:300]
+            except Exception:
+                pass
+            raise RuntimeError(
+                f"Llama.cpp 응답 오류 (HTTP {resp.status_code}): {body or '응답 본문 없음'}"
+            )
+
         for line in resp.iter_lines():
             if not line:
                 continue
@@ -666,78 +707,25 @@ def translate_with_llamacpp(prompt: str) -> str:
                 line = line[6:].strip()
             if not line or line == "[DONE]":
                 break
-            import json
             try:
                 data = json.loads(line)
-                if data.get("choices"):
-                    delta = data["choices"][0].get("delta", {}).get("content", "")
-                    if delta:
-                        kr_text += delta
-                        current_kr = kr_text
             except json.JSONDecodeError:
                 continue
-    return kr_text
+            if data.get("choices"):
+                delta = data["choices"][0].get("delta", {}).get("content", "")
+                if delta:
+                    yield delta
 
 
 def translate_worker(_worker_id: int):
     global current_kr, status_msg, translate_pending, error_msg
 
     while is_running:
+        # 큐에서 먼저 꺼낸 뒤 세마포어를 잡는다.
+        # 세마포어를 잡은 상태로 큐를 기다리면, permit이 있는 워커가
+        # 빈 큐를 점유해 다른 워커를 굶주리게 만들 수 있다.
         try:
-            # 세마포어로 GPU VRAM 보호 (동시 번역 수 제한)
-            with translation_semaphore:
-                item = translate_queue.get(timeout=0.5)
-                src_text = item["text"]
-                src_lang = item.get("lang", SOURCE_LANG)
-                translate_pending = translate_queue.qsize()
-                status_msg = "🔄  번역 중..."
-
-                # 큐 임계값 초과 시 새 요청 거부 (메모리 보호)
-                if translate_pending > 15:
-                    logging.warning(f"[번역-{_worker_id}] 큐 임계값 초과 ({translate_pending}/20) → 스킵")
-                    continue
-
-                try:
-                    prompt = _build_prompt(src_text, src_lang)
-                    logging.info(f"[번역-{_worker_id}] 요청 중... (백엔드: Llama.cpp, 언어: {src_lang})")
-                    logging.debug(f"[번역-{_worker_id}] 프롬프트:\n{prompt}")
-                    start_time = time.time()
-
-                    # 스트리밍 응답으로 실시간 번역 결과 표시
-                    kr_text = ""
-                    current_kr = ""  # 초기화
-
-                    for chunk in translate_with_llamacpp(prompt):
-                        kr_text += chunk
-                        current_kr = kr_text
-
-                    elapsed = time.time() - start_time
-                    logging.info(f"[번역-{_worker_id}] 완료 ({elapsed:.1f}초): {kr_text}")
-                    current_kr = kr_text
-                    error_msg = ""
-
-                    # 히스토리 추가 (스레드 안전)
-                    lang_flag = {"ja": "🇯🇵", "en": "🇺🇸", "zh": "🇨🇳"}.get(src_lang, "🌐")
-                    with history_lock:
-                        history.insert(0, {
-                            "time": datetime.now().strftime("%H:%M:%S"),
-                            "src": src_text,
-                            "kr": kr_text,
-                            "lang": src_lang,
-                            "flag": lang_flag,
-                        })
-                        if len(history) > MAX_HISTORY:
-                            history.pop()
-
-                    status_msg = "✅  번역 완료"
-                    time.sleep(0.3)
-                    status_msg = "대기 중"
-                except Exception as e:
-                    error_msg = f"번역 오류: {e}"
-                    logging.error(f"[번역-{_worker_id} 오류] {e}")
-                    status_msg = "대기 중"
-                    continue
-
+            item = translate_queue.get(timeout=0.5)
         except queue.Empty:
             translate_pending = 0
             continue
@@ -745,6 +733,67 @@ def translate_worker(_worker_id: int):
             error_msg = f"오류: {e}"
             logging.error(f"[Translate Worker 오류] {e}")
             status_msg = "대기 중"
+            continue
+
+        # 세마포어로 GPU VRAM 보호 (동시 번역 수 제한)
+        with translation_semaphore:
+            src_text = item["text"]
+            src_lang = item.get("lang", SOURCE_LANG)
+            translate_pending = translate_queue.qsize()
+            status_msg = "🔄  번역 중..."
+
+            # 큐 임계값 초과 시 새 요청 거부 (메모리 보호)
+            if translate_pending > 15:
+                logging.warning(f"[번역-{_worker_id}] 큐 임계값 초과 ({translate_pending}/20) → 스킵")
+                continue
+
+            try:
+                prompt = _build_prompt(src_text, src_lang)
+                logging.info(f"[번역-{_worker_id}] 요청 중... (백엔드: Llama.cpp, 언어: {src_lang})")
+                logging.debug(f"[번역-{_worker_id}] 프롬프트:\n{prompt}")
+                start_time = time.time()
+
+                # 스트리밍 응답으로 실시간 번역 결과 표시
+                kr_text = ""
+                current_kr = ""  # 초기화
+
+                for chunk in translate_with_llamacpp(prompt):
+                    if not chunk:
+                        continue
+                    kr_text += chunk
+                    current_kr = kr_text
+
+                elapsed = time.time() - start_time
+                logging.info(f"[번역-{_worker_id}] 완료 ({elapsed:.1f}초): {kr_text}")
+                current_kr = kr_text
+                error_msg = ""
+
+                if not kr_text.strip():
+                    logging.warning(f"[번역-{_worker_id}] 빈 응답 수신 (서버 로그 확인 필요)")
+                    status_msg = "대기 중"
+                    continue
+
+                # 히스토리 추가 (스레드 안전)
+                lang_flag = {"ja": "🇯🇵", "en": "🇺🇸", "zh": "🇨🇳"}.get(src_lang, "🌐")
+                with history_lock:
+                    history.insert(0, {
+                        "time": datetime.now().strftime("%H:%M:%S"),
+                        "src": src_text,
+                        "kr": kr_text,
+                        "lang": src_lang,
+                        "flag": lang_flag,
+                    })
+                    if len(history) > MAX_HISTORY:
+                        history.pop()
+
+                status_msg = "✅  번역 완료"
+                time.sleep(0.3)
+                status_msg = "대기 중"
+            except Exception as e:
+                error_msg = f"번역 오류: {e}"
+                logging.error(f"[번역-{_worker_id} 오류] {e}")
+                status_msg = "대기 중"
+                continue
 
 
 # ─────────────────────────────────────────────
@@ -876,7 +925,7 @@ def select_language() -> str:
 
 
 def main():
-    global is_running, SOURCE_LANG
+    global is_running, SOURCE_LANG, current_device_idx, translation_semaphore, audio_stream
 
     console.print(
         Panel(
@@ -930,11 +979,9 @@ def main():
     console.print(f"[green]✓ 선택된 장치: {device_name}[/green]\n")
 
     # 전역 변수 설정 (런타임 변경용)
-    global current_device_idx
     current_device_idx = device_idx
 
     # GPU 효율화: 세마포어 초기화 (동시 번역 수 제한)
-    global translation_semaphore
     translation_semaphore = threading.Semaphore(LLM_MAX_CONCURRENT)
 
     gpu_mode = "CPU only" if LLM_GPU_LAYERS == 0 else f"GPU ({LLM_GPU_LAYERS} layers)"
@@ -993,15 +1040,16 @@ def main():
     )
 
     # Ctrl+C 핸들러
+    # sys.exit()로 끝내면 오디오 스트림을 닫는 코드까지 건너뛰어
+    # PortAudio 리소스가 남았으므로, 플래그만 내려 graceful 종료한다.
     def stop(sig, frame):
         global is_running
         is_running = False
         console.print("\n[yellow]⏹  종료 중...[/yellow]")
-        sys.exit(0)
 
     signal.signal(signal.SIGINT, stop)
 
-    # 4단계: 명령 핸들러 스레드 (D=장치변경, M=모델변경)
+    # 4단계: 명령 핸들러 스레드 (키 입력 감지만 담당, 실제 실행은 메인 스레드)
     cmd_thread = threading.Thread(
         target=command_handler,
         daemon=True,
@@ -1011,7 +1059,6 @@ def main():
 
     # 오디오 스트림 + Live UI
     try:
-        global audio_stream
         audio_stream = sd.InputStream(
             device=device_idx,
             channels=CHANNELS,
@@ -1023,25 +1070,26 @@ def main():
 
         with Live(build_ui(), refresh_per_second=4, screen=True, console=console) as live:
             while is_running:
-                # command_queue에 장치/모델 변경 요청이 있는지 확인
+                # command_queue 처리: 메인 스레드만 소비 (명령 핸들러 스레드는 넣기만 한다)
                 try:
                     cmd = command_queue.get_nowait()
-                    # Live 일시 중단 후 처리
-                    live.stop()
-                    if cmd == "change_device":
-                        handle_device_change()
-                    elif cmd == "change_model":
-                        handle_model_change()
-                    # Live 재개
-                    live.start()
                 except queue.Empty:
-                    pass
+                    cmd = None
+
+                if cmd:
+                    # Live 일시 중단 후 처리 (처리 중 예외가 나도 Live는 반드시 재개)
+                    live.stop()
+                    try:
+                        if cmd == "change_device":
+                            handle_device_change()
+                        elif cmd == "change_gpu":
+                            change_llamacpp_settings()
+                    finally:
+                        live.start()
 
                 live.update(build_ui())
                 time.sleep(0.25)
 
-        audio_stream.close()
-        audio_stream = None
     except sd.PortAudioError as e:
         console.print(f"[red]오디오 스트림 오류: {e}[/red]")
         if "Invalid sample rate" in str(e):
@@ -1060,6 +1108,16 @@ def main():
     except Exception as e:
         console.print(f"[red]오류: {e}[/red]")
         sys.exit(1)
+    finally:
+        # 종료 경로와 무관하게 오디오 스트림을 반드시 정리한다
+        if audio_stream is not None:
+            try:
+                audio_stream.close()
+            except Exception:
+                pass
+            audio_stream = None
+
+    logging.info("--- 프로그램 종료 ---")
 
 
 if __name__ == "__main__":

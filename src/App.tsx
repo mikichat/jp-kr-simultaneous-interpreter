@@ -46,10 +46,16 @@ export default function App() {
   const recorderRef = useRef<MediaRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
-  const chunksRef = useRef<Blob[]>([]);
   const animFrameRef = useRef<number>(0);
   const isCapturingRef = useRef(false);
   const genAIRef = useRef(genAI);
+
+  // 녹음(제작)과 번역(소비)을 분리하기 위한 대기열
+  // 번역 API 응답이 느려도 녹음은 멈추지 않는다.
+  const pendingChunksRef = useRef<Blob[]>([]);
+  const isProcessingRef = useRef(false);
+  // 히스토리 ID 충돌 방지용 단조 증가 카운터
+  const idCounterRef = useRef(0);
 
   // Update genAI when apiKey changes
   useEffect(() => {
@@ -95,12 +101,15 @@ export default function App() {
     const waveArray = new Uint8Array(40);
 
     const animate = () => {
-      analyserRef.current!.getByteFrequencyData(dataArray);
+      // AudioContext가 닫힌 뒤에는 루프를 멈춘다 (잔여 프레임에서 예외 방지)
+      if (!analyserRef.current || !audioContextRef.current) return;
+
+      analyserRef.current.getByteFrequencyData(dataArray);
       const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
       setVolume(Math.min(100, (avg / 128) * 100));
 
       // Waveform
-      analyserRef.current!.getByteTimeDomainData(waveArray);
+      analyserRef.current.getByteTimeDomainData(waveArray);
       const wave = Array.from(waveArray).map(v => ((v - 128) / 128));
       setWaveformData(wave);
 
@@ -113,22 +122,32 @@ export default function App() {
     cancelAnimationFrame(animFrameRef.current);
     audioContextRef.current?.close();
     audioContextRef.current = null;
+    analyserRef.current = null;
     setVolume(0);
     setWaveformData(Array(40).fill(0));
   }, []);
 
+  // Blob → Base64 (FileReader 사용: 문자열 반복 연결보다 빠르고 스택 위험이 없음)
+  const blobToBase64 = useCallback((blob: Blob): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        const result = reader.result as string;
+        const commaIdx = result.indexOf(',');
+        resolve(commaIdx >= 0 ? result.slice(commaIdx + 1) : result);
+      };
+      reader.onerror = () => reject(reader.error ?? new Error('파일 읽기 실패'));
+      reader.readAsDataURL(blob);
+    });
+  }, []);
+
   const translateAudioChunk = useCallback(async (audioBlob: Blob) => {
     if (!apiKey && !process.env.GEMINI_API_KEY) return;
-    
-    setIsTranslating(true);
+
     setTotalChunks(prev => prev + 1);
 
     try {
-      const arrayBuffer = await audioBlob.arrayBuffer();
-      const uint8Array = new Uint8Array(arrayBuffer);
-      let binary = '';
-      uint8Array.forEach(byte => binary += String.fromCharCode(byte));
-      const base64Audio = btoa(binary);
+      const base64Audio = await blobToBase64(audioBlob);
 
       const mimeType = audioBlob.type || 'audio/webm';
 
@@ -161,7 +180,7 @@ export default function App() {
       });
 
       const text = response.text || '';
-      
+
       // JSON 파싱
       const jsonMatch = text.match(/\{[\s\S]*\}/);
       if (jsonMatch) {
@@ -170,7 +189,8 @@ export default function App() {
           setCurrentJP(parsed.jp);
           setCurrentKR(parsed.kr);
           const entry: TranslationEntry = {
-            id: Date.now().toString(),
+            // Date.now()만 쓰면 같은 밀리초에 완료된 청크가 ID가 겹친다
+            id: `${Date.now()}-${idCounterRef.current++}`,
             jp: parsed.jp,
             kr: parsed.kr,
             timestamp: new Date(),
@@ -241,10 +261,27 @@ export default function App() {
 
       setErrorDetail({ title, detail, hint });
       setError(title);
+    }
+  }, [apiKey, blobToBase64]);
+
+  // 대기 중인 청크를 순서대로 번역한다.
+  // 녹음과 완전히 분리되어 있어, 번역이 늦어져도 오디오가 유실되지 않는다.
+  const drainQueue = useCallback(async () => {
+    if (isProcessingRef.current) return;
+    isProcessingRef.current = true;
+    setIsTranslating(true);
+    try {
+      while (pendingChunksRef.current.length > 0) {
+        const blob = pendingChunksRef.current.shift();
+        if (blob) {
+          await translateAudioChunk(blob);
+        }
+      }
     } finally {
+      isProcessingRef.current = false;
       setIsTranslating(false);
     }
-  }, [apiKey]);
+  }, [translateAudioChunk]);
 
   const startCapture = useCallback(async () => {
     if (!apiKey && !process.env.GEMINI_API_KEY) {
@@ -254,11 +291,11 @@ export default function App() {
     }
 
     setError('');
-    
+
     try {
       const constraints: MediaStreamConstraints = {
-        audio: selectedDevice === 'default' 
-          ? true 
+        audio: selectedDevice === 'default'
+          ? true
           : { deviceId: { exact: selectedDevice } },
         video: false,
       };
@@ -294,24 +331,28 @@ export default function App() {
           audioBitsPerSecond: 16000,
         });
 
-        chunksRef.current = [];
+        // 녹음 데이터는 레코더별 로컬 배열에 담는다 (공유 ref 경합 방지)
+        const localChunks: Blob[] = [];
 
         recorder.ondataavailable = (e) => {
           if (e.data.size > 0) {
-            chunksRef.current.push(e.data);
+            localChunks.push(e.data);
           }
         };
 
-        recorder.onstop = async () => {
-          if (chunksRef.current.length > 0) {
-            const blob = new Blob(chunksRef.current, { type: supportedMime });
+        recorder.onstop = () => {
+          if (localChunks.length > 0) {
+            const blob = new Blob(localChunks, { type: supportedMime });
             if (blob.size > 1000) { // 너무 작은 청크는 무시
-              await translateAudioChunk(blob);
+              pendingChunksRef.current.push(blob);
+              // 번역은 백그라운드에서 순서대로 진행 (녹음은 멈추지 않는다)
+              void drainQueue();
             }
           }
-          // 다음 청크 녹음 시작
+
+          // 번역 응답을 기다리지 않고 바로 다음 청크 녹음을 시작한다
           if (isCapturingRef.current) {
-            setTimeout(recordChunk, 100);
+            setTimeout(recordChunk, 0);
           }
         };
 
@@ -324,6 +365,7 @@ export default function App() {
         }, CHUNK_DURATION_MS);
       };
 
+      pendingChunksRef.current = [];
       recordChunk();
 
     } catch (err: any) {
@@ -338,18 +380,23 @@ export default function App() {
       setIsCapturing(false);
       isCapturingRef.current = false;
     }
-  }, [apiKey, selectedDevice, startVolumeMonitor, translateAudioChunk]);
+  }, [apiKey, selectedDevice, startVolumeMonitor, translateAudioChunk, drainQueue]);
 
   const stopCapture = useCallback(() => {
     isCapturingRef.current = false;
     setIsCapturing(false);
 
-    if (recorderRef.current && recorderRef.current.state === 'recording') {
-      recorderRef.current.stop();
-    }
-
-    if (streamRef.current) {
-      streamRef.current.getTracks().forEach(track => track.stop());
+    const recorder = recorderRef.current;
+    if (recorder && recorder.state === 'recording') {
+      // 마지막 청크 데이터가 flush된 뒤에 스트림을 정리한다
+      // (즉시 종료하면 마지막 오디오가 잘려나간다)
+      recorder.addEventListener('stop', () => {
+        streamRef.current?.getTracks().forEach(track => track.stop());
+        streamRef.current = null;
+      }, { once: true });
+      recorder.stop();
+    } else {
+      streamRef.current?.getTracks().forEach(track => track.stop());
       streamRef.current = null;
     }
 
@@ -370,8 +417,13 @@ export default function App() {
     window.speechSynthesis.speak(utterance);
   };
 
-  const copyToClipboard = (text: string) => {
-    navigator.clipboard.writeText(text);
+  const copyToClipboard = async (text: string) => {
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      setError('클립보드 복사에 실패했습니다. 브라우저 권한을 확인해주세요.');
+      setErrorDetail(null);
+    }
   };
 
   return (
